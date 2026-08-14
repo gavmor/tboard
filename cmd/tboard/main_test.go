@@ -73,6 +73,14 @@ func TestRenderSparkline(t *testing.T) {
 	}
 }
 
+func TestRenderTable(t *testing.T) {
+	m := initialModel()
+	tbl := m.renderTable()
+	if tbl == "" {
+		t.Error("expected non-empty table output")
+	}
+}
+
 func TestModelBubblesComponents(t *testing.T) {
 	m := initialModel()
 	if len(m.targets) != 5 {

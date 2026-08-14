@@ -13,7 +13,6 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -114,10 +113,11 @@ func newKeyMap() keyMap {
 	return keyMap{
 		Up: key.NewBinding(
 			key.WithKeys("up", "k"),
-			key.WithHelp("j/k/↑↓", "select"),
+			key.WithHelp("k/↑", "up"),
 		),
 		Down: key.NewBinding(
 			key.WithKeys("down", "j"),
+			key.WithHelp("j/↓", "down"),
 		),
 		Add: key.NewBinding(
 			key.WithKeys("a"),
@@ -151,12 +151,12 @@ func newKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Add, k.Delete, k.Theme, k.Pause, k.Reset, k.Help, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Add, k.Delete, k.Theme, k.Pause, k.Reset, k.Help, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Add, k.Delete},
+		{k.Up, k.Down, k.Add, k.Delete},
 		{k.Theme, k.Pause, k.Reset},
 		{k.Help, k.Quit},
 	}
@@ -287,7 +287,7 @@ var themes = []Theme{
 	},
 }
 
-// ANSI Color helper functions that isolate FG/BG without wiping row background resets
+// ANSI Color helper functions
 func colorToFGANSI(c lipgloss.TerminalColor) string {
 	switch v := c.(type) {
 	case lipgloss.Color:
@@ -436,6 +436,7 @@ func pingHostCmd(index int, host string, port int) tea.Cmd {
 // Model
 type model struct {
 	targets    []Target
+	cursor     int
 	width      int
 	height     int
 	paused     bool
@@ -445,7 +446,6 @@ type model struct {
 	themeIdx   int
 
 	// Bubbles Components
-	table    table.Model
 	spinner  spinner.Model
 	progress progress.Model
 	help     help.Model
@@ -471,23 +471,6 @@ func initialModel() model {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(themes[1].InputPrompt)
 
-	// Table with wide sparkline column (Width 22)
-	cols := []table.Column{
-		{Title: "STATUS", Width: 8},
-		{Title: "HOST", Width: 18},
-		{Title: "PORT", Width: 6},
-		{Title: "SPARKLINE (LATENCY)", Width: 22},
-		{Title: "LAST RTT", Width: 10},
-		{Title: "AVG RTT", Width: 10},
-		{Title: "LOSS %", Width: 10},
-	}
-
-	tbl := table.New(
-		table.WithColumns(cols),
-		table.WithFocused(true),
-		table.WithHeight(7),
-	)
-
 	// Progress
 	prog := progress.New(
 		progress.WithScaledGradient("#79740e", "#9d0006"),
@@ -499,10 +482,10 @@ func initialModel() model {
 
 	m := model{
 		targets:    defaultTargets,
+		cursor:     0,
 		paused:     false,
 		inputField: ti,
 		themeIdx:   1, // Default Gruvbox Light
-		table:      tbl,
 		spinner:    sp,
 		progress:   prog,
 		help:       h,
@@ -510,63 +493,16 @@ func initialModel() model {
 	}
 
 	m.applyThemeStyles()
-	m.updateTableRows()
 	return m
 }
 
 func (m *model) applyThemeStyles() {
 	th := themes[m.themeIdx]
-
-	s := table.DefaultStyles()
-	s.Header = s.Header.
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(th.CardBorder).
-		BorderBottom(true).
-		Bold(true).
-		Foreground(th.DetailTitle)
-	s.Selected = s.Selected.
-		Foreground(th.HostText).
-		Background(th.CardBorder).
-		Bold(true)
-	m.table.SetStyles(s)
-
 	m.spinner.Style = lipgloss.NewStyle().Foreground(th.InputPrompt)
 	m.help.Styles.ShortKey = lipgloss.NewStyle().Foreground(th.FooterKey)
 	m.help.Styles.ShortDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
 	m.help.Styles.FullKey = lipgloss.NewStyle().Foreground(th.FooterKey)
 	m.help.Styles.FullDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
-}
-
-func (m *model) updateTableRows() {
-	th := themes[m.themeIdx]
-	rows := make([]table.Row, len(m.targets))
-	for i, t := range m.targets {
-		badge := renderBadge(t.Status, th)
-		spark := renderSparkline(t.Rtts, 20, th)
-
-		rttStr := "---"
-		if t.LastRtt > 0 && t.Status != "DOWN" {
-			rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())
-		}
-
-		avgStr := "---"
-		if t.AvgRtt > 0 {
-			avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
-		}
-
-		lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
-
-		rows[i] = table.Row{
-			badge,
-			t.Host,
-			strconv.Itoa(t.Port),
-			spark,
-			rttStr,
-			avgStr,
-			lossStr,
-		}
-	}
-	m.table.SetRows(rows)
 }
 
 func (m model) Init() tea.Cmd {
@@ -604,7 +540,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pingResultMsg:
 		if msg.index >= 0 && msg.index < len(m.targets) {
 			m.targets[msg.index].AddResult(msg.rtt, msg.err)
-			m.updateTableRows()
 		}
 
 	case spinner.TickMsg:
@@ -628,7 +563,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.targets = append(m.targets, newTarget(host, port))
-					m.updateTableRows()
 					newIdx := len(m.targets) - 1
 					cmds = append(cmds, pingHostCmd(newIdx, host, port))
 					m.statusMsg = fmt.Sprintf("Added target %s:%d", host, port)
@@ -654,17 +588,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
 
+		case key.Matches(msg, m.keys.Up):
+			if m.cursor > 0 {
+				m.cursor--
+			}
+
+		case key.Matches(msg, m.keys.Down):
+			if m.cursor < len(m.targets)-1 {
+				m.cursor++
+			}
+
 		case key.Matches(msg, m.keys.Add):
 			m.addingHost = true
 			m.inputField.Focus()
 			return m, textinput.Blink
 
 		case key.Matches(msg, m.keys.Delete):
-			cursor := m.table.Cursor()
-			if len(m.targets) > 0 && cursor < len(m.targets) {
-				removed := m.targets[cursor].Host
-				m.targets = append(m.targets[:cursor], m.targets[cursor+1:]...)
-				m.updateTableRows()
+			if len(m.targets) > 0 && m.cursor < len(m.targets) {
+				removed := m.targets[m.cursor].Host
+				m.targets = append(m.targets[:m.cursor], m.targets[m.cursor+1:]...)
+				if m.cursor >= len(m.targets) && m.cursor > 0 {
+					m.cursor--
+				}
 				m.statusMsg = fmt.Sprintf("Removed target %s", removed)
 			}
 
@@ -679,7 +624,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Theme):
 			m.themeIdx = (m.themeIdx + 1) % len(themes)
 			m.applyThemeStyles()
-			m.updateTableRows()
 			m.statusMsg = fmt.Sprintf("Switched theme to: %s", themes[m.themeIdx].Name)
 
 		case key.Matches(msg, m.keys.Reset):
@@ -692,21 +636,75 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.targets[i].AvgRtt = 0
 				m.targets[i].Status = "PENDING"
 			}
-			m.updateTableRows()
 			m.statusMsg = "Stats reset"
 
 		case key.Matches(msg, m.keys.Help):
 			m.help.ShowAll = !m.help.ShowAll
-
-		default:
-			// Let table handle navigation (up/down/j/k)
-			var cmd tea.Cmd
-			m.table, cmd = m.table.Update(msg)
-			cmds = append(cmds, cmd)
 		}
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m model) renderTable() string {
+	th := themes[m.themeIdx]
+	var sb strings.Builder
+
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(th.DetailTitle)
+	header := fmt.Sprintf("%-8s %-20s %-6s %-22s %-10s %-10s %-8s",
+		"STATUS", "HOST", "PORT", "SPARKLINE (LATENCY)", "LAST RTT", "AVG RTT", "LOSS %",
+	)
+	sb.WriteString(headerStyle.Render(header) + "\n")
+
+	divider := lipgloss.NewStyle().Foreground(th.CardBorder).Render(strings.Repeat("─", 88))
+	sb.WriteString(divider + "\n")
+
+	sparkWidth := 20
+	if m.width > 90 {
+		sparkWidth = 22
+	}
+
+	for i, t := range m.targets {
+		cursorStr := " "
+		rowStyle := lipgloss.NewStyle()
+		if i == m.cursor {
+			cursorStr = "❯"
+			rowStyle = lipgloss.NewStyle().
+				Background(th.CardBorder).
+				Foreground(th.HostText).
+				Bold(true)
+		}
+
+		badge := renderBadge(t.Status, th)
+		spark := renderSparkline(t.Rtts, sparkWidth, th)
+
+		rttStr := "---"
+		if t.LastRtt > 0 && t.Status != "DOWN" {
+			rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())
+		}
+
+		avgStr := "---"
+		if t.AvgRtt > 0 {
+			avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+		}
+
+		lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
+
+		rowContent := fmt.Sprintf("%s %s %-20s %-6d %s %-10s %-10s %-8s",
+			cursorStr,
+			badge,
+			t.Host,
+			t.Port,
+			spark,
+			rttStr,
+			avgStr,
+			lossStr,
+		)
+
+		sb.WriteString(rowStyle.Render(rowContent) + "\n")
+	}
+
+	return sb.String()
 }
 
 func (m model) View() string {
@@ -731,12 +729,11 @@ func (m model) View() string {
 	doc.WriteString(header + "\n\n")
 
 	// Table View
-	doc.WriteString(m.table.View() + "\n")
+	doc.WriteString(m.renderTable() + "\n")
 
 	// Details Panel for Selected Target
-	cursor := m.table.Cursor()
-	if len(m.targets) > 0 && cursor < len(m.targets) {
-		selected := m.targets[cursor]
+	if len(m.targets) > 0 && m.cursor < len(m.targets) {
+		selected := m.targets[m.cursor]
 		doc.WriteString("\n")
 
 		detailTitle := lipgloss.NewStyle().Bold(true).Foreground(th.DetailTitle).Render(fmt.Sprintf("Target Details: %s:%d", selected.Host, selected.Port))
