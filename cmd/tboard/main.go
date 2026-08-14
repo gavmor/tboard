@@ -287,6 +287,123 @@ var themes = []Theme{
 	},
 }
 
+// ANSI Color helper functions that isolate FG/BG without wiping row background resets
+func colorToFGANSI(c lipgloss.TerminalColor) string {
+	switch v := c.(type) {
+	case lipgloss.Color:
+		hex := strings.TrimPrefix(string(v), "#")
+		if len(hex) == 6 {
+			var r, g, b uint8
+			fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b)
+			return fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, b)
+		}
+	case lipgloss.AdaptiveColor:
+		hex := v.Light
+		if lipgloss.HasDarkBackground() {
+			hex = v.Dark
+		}
+		hex = strings.TrimPrefix(hex, "#")
+		if len(hex) == 6 {
+			var r, g, b uint8
+			fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b)
+			return fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, b)
+		}
+	}
+	return ""
+}
+
+func colorToBGANSI(c lipgloss.TerminalColor) string {
+	switch v := c.(type) {
+	case lipgloss.Color:
+		hex := strings.TrimPrefix(string(v), "#")
+		if len(hex) == 6 {
+			var r, g, b uint8
+			fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b)
+			return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", r, g, b)
+		}
+	case lipgloss.AdaptiveColor:
+		hex := v.Light
+		if lipgloss.HasDarkBackground() {
+			hex = v.Dark
+		}
+		hex = strings.TrimPrefix(hex, "#")
+		if len(hex) == 6 {
+			var r, g, b uint8
+			fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b)
+			return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", r, g, b)
+		}
+	}
+	return ""
+}
+
+func renderSparkline(rtts []time.Duration, width int, th Theme) string {
+	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	emptyFG := colorToFGANSI(th.SparklineEmpty)
+	greenFG := colorToFGANSI(th.SparklineGreen)
+	yelFG := colorToFGANSI(th.SparklineYel)
+	redFG := colorToFGANSI(th.SparklineRed)
+
+	if len(rtts) == 0 {
+		return emptyFG + strings.Repeat("░", width) + "\x1b[39m"
+	}
+
+	var sb strings.Builder
+
+	slice := rtts
+	if len(slice) > width {
+		slice = slice[len(slice)-width:]
+	}
+
+	for i := 0; i < width-len(slice); i++ {
+		sb.WriteString(emptyFG)
+		sb.WriteRune('░')
+	}
+
+	for _, rtt := range slice {
+		if rtt < 0 {
+			sb.WriteString(redFG)
+			sb.WriteRune('✕')
+			continue
+		}
+
+		ms := float64(rtt.Microseconds()) / 1000.0
+		idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
+
+		if ms < 40 {
+			sb.WriteString(greenFG)
+		} else if ms < 120 {
+			sb.WriteString(yelFG)
+		} else {
+			sb.WriteString(redFG)
+		}
+
+		sb.WriteRune(blocks[idx])
+	}
+
+	sb.WriteString("\x1b[39m") // Reset foreground only
+	return sb.String()
+}
+
+func renderBadge(status string, th Theme) string {
+	var fg, bg lipgloss.TerminalColor
+	var text string
+
+	switch status {
+	case "UP":
+		fg, bg, text = th.BadgeUpFg, th.BadgeUpBg, " UP "
+	case "SLOW":
+		fg, bg, text = th.BadgeSlowFg, th.BadgeSlowBg, "SLOW"
+	case "DOWN":
+		fg, bg, text = th.BadgeDownFg, th.BadgeDownBg, "DOWN"
+	default:
+		fg, bg, text = th.BadgePendingFg, th.BadgePendingBg, "WAIT"
+	}
+
+	fgAnsi := colorToFGANSI(fg)
+	bgAnsi := colorToBGANSI(bg)
+	return fgAnsi + bgAnsi + "\x1b[1m" + text + "\x1b[22;39;49m"
+}
+
 // Messages
 type tickMsg time.Time
 type pingResultMsg struct {
@@ -354,7 +471,7 @@ func initialModel() model {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(themes[1].InputPrompt)
 
-	// Table
+	// Table with wide sparkline column (Width 22)
 	cols := []table.Column{
 		{Title: "STATUS", Width: 8},
 		{Title: "HOST", Width: 18},
@@ -590,61 +707,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
-}
-
-func renderSparkline(rtts []time.Duration, width int, th Theme) string {
-	if len(rtts) == 0 {
-		return lipgloss.NewStyle().Foreground(th.SparklineEmpty).Render(strings.Repeat("░", width))
-	}
-	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
-	var sb strings.Builder
-
-	slice := rtts
-	if len(slice) > width {
-		slice = slice[len(slice)-width:]
-	}
-
-	for i := 0; i < width-len(slice); i++ {
-		sb.WriteString(lipgloss.NewStyle().Foreground(th.SparklineEmpty).Render("░"))
-	}
-
-	for _, rtt := range slice {
-		if rtt < 0 {
-			sb.WriteString(lipgloss.NewStyle().Foreground(th.SparklineRed).Render("✕"))
-			continue
-		}
-
-		ms := float64(rtt.Microseconds()) / 1000.0
-		idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
-
-		var color lipgloss.TerminalColor
-		if ms < 40 {
-			color = th.SparklineGreen
-		} else if ms < 120 {
-			color = th.SparklineYel
-		} else {
-			color = th.SparklineRed
-		}
-
-		sb.WriteString(lipgloss.NewStyle().Foreground(color).Render(string(blocks[idx])))
-	}
-
-	return sb.String()
-}
-
-func renderBadge(status string, th Theme) string {
-	badgeStyle := lipgloss.NewStyle().Bold(true).Padding(0, 1)
-
-	switch status {
-	case "UP":
-		return badgeStyle.Foreground(th.BadgeUpFg).Background(th.BadgeUpBg).Render("UP")
-	case "SLOW":
-		return badgeStyle.Foreground(th.BadgeSlowFg).Background(th.BadgeSlowBg).Render("SLOW")
-	case "DOWN":
-		return badgeStyle.Foreground(th.BadgeDownFg).Background(th.BadgeDownBg).Render("DOWN")
-	default:
-		return badgeStyle.Foreground(th.BadgePendingFg).Background(th.BadgePendingBg).Render("WAIT")
-	}
 }
 
 func (m model) View() string {
