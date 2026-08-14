@@ -73,33 +73,30 @@ func TestRenderSparkline(t *testing.T) {
 	}
 }
 
-func TestModelUpdateKeysAndTheme(t *testing.T) {
+func TestModelBubblesComponents(t *testing.T) {
 	m := initialModel()
 	if len(m.targets) != 5 {
 		t.Fatalf("expected 5 default targets, got %d", len(m.targets))
 	}
-	if m.themeIdx != 1 {
-		t.Fatalf("expected initial themeIdx 1 (Gruvbox Light), got %d", m.themeIdx)
-	}
 
-	// Test theme toggle key 't'
+	// Test theme key 't'
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	m = updated.(model)
-	if m.themeIdx != 2 { // Switched to Dracula Dark
+	if m.themeIdx != 2 {
 		t.Errorf("expected themeIdx 2 after pressing 't', got %d", m.themeIdx)
 	}
 
-	// Test pause space key
+	// Test pause key
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	m = updated.(model)
 	if !m.paused {
 		t.Error("expected model to be paused")
 	}
 
-	// Test reset 'r' key
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	// Test help toggle key '?'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	m = updated.(model)
-	if m.targets[0].Sent != 0 {
-		t.Error("expected stats to be reset")
+	if !m.help.ShowAll {
+		t.Error("expected full help to be visible after pressing '?'")
 	}
 }

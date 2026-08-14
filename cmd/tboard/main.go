@@ -9,6 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -68,7 +73,6 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 			t.MaxRtt = rtt
 		}
 
-		// Calculate total RTT for average
 		var total time.Duration
 		validCount := 0
 		for _, r := range t.Rtts {
@@ -81,7 +85,6 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 			t.AvgRtt = total / time.Duration(validCount)
 		}
 
-		// Status calculation based on latency
 		if rtt > 200*time.Millisecond {
 			t.Status = "SLOW"
 		} else {
@@ -91,6 +94,71 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 
 	if len(t.Rtts) > maxHistory {
 		t.Rtts = t.Rtts[1:]
+	}
+}
+
+// KeyMap defines keybindings using bubbles/key
+type keyMap struct {
+	Up     key.Binding
+	Down   key.Binding
+	Add    key.Binding
+	Delete key.Binding
+	Theme  key.Binding
+	Pause  key.Binding
+	Reset  key.Binding
+	Help   key.Binding
+	Quit   key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		Up: key.NewBinding(
+			key.WithKeys("up", "k"),
+			key.WithHelp("j/k/↑↓", "select"),
+		),
+		Down: key.NewBinding(
+			key.WithKeys("down", "j"),
+		),
+		Add: key.NewBinding(
+			key.WithKeys("a"),
+			key.WithHelp("a", "add host"),
+		),
+		Delete: key.NewBinding(
+			key.WithKeys("d"),
+			key.WithHelp("d", "delete"),
+		),
+		Theme: key.NewBinding(
+			key.WithKeys("t"),
+			key.WithHelp("t", "theme"),
+		),
+		Pause: key.NewBinding(
+			key.WithKeys("space", " "),
+			key.WithHelp("space", "pause"),
+		),
+		Reset: key.NewBinding(
+			key.WithKeys("r"),
+			key.WithHelp("r", "reset"),
+		),
+		Help: key.NewBinding(
+			key.WithKeys("?"),
+			key.WithHelp("?", "help"),
+		),
+		Quit: key.NewBinding(
+			key.WithKeys("q", "ctrl+c"),
+			key.WithHelp("q", "quit"),
+		),
+	}
+}
+
+func (k keyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.Up, k.Add, k.Delete, k.Theme, k.Pause, k.Reset, k.Help, k.Quit}
+}
+
+func (k keyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{
+		{k.Up, k.Add, k.Delete},
+		{k.Theme, k.Pause, k.Reset},
+		{k.Help, k.Quit},
 	}
 }
 
@@ -251,7 +319,6 @@ func pingHostCmd(index int, host string, port int) tea.Cmd {
 // Model
 type model struct {
 	targets    []Target
-	cursor     int
 	width      int
 	height     int
 	paused     bool
@@ -259,6 +326,13 @@ type model struct {
 	inputField textinput.Model
 	statusMsg  string
 	themeIdx   int
+
+	// Bubbles Components
+	table    table.Model
+	spinner  spinner.Model
+	progress progress.Model
+	help     help.Model
+	keys     keyMap
 }
 
 func initialModel() model {
@@ -275,20 +349,113 @@ func initialModel() model {
 		newTarget("127.0.0.1", 80),
 	}
 
-	return model{
+	// Spinner
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(themes[1].InputPrompt)
+
+	// Table
+	cols := []table.Column{
+		{Title: "STATUS", Width: 8},
+		{Title: "HOST", Width: 18},
+		{Title: "PORT", Width: 6},
+		{Title: "SPARKLINE (LATENCY)", Width: 22},
+		{Title: "LAST RTT", Width: 10},
+		{Title: "AVG RTT", Width: 10},
+		{Title: "LOSS %", Width: 10},
+	}
+
+	tbl := table.New(
+		table.WithColumns(cols),
+		table.WithFocused(true),
+		table.WithHeight(7),
+	)
+
+	// Progress
+	prog := progress.New(
+		progress.WithScaledGradient("#79740e", "#9d0006"),
+		progress.WithoutPercentage(),
+	)
+
+	// Help
+	h := help.New()
+
+	m := model{
 		targets:    defaultTargets,
-		cursor:     0,
 		paused:     false,
 		inputField: ti,
-		themeIdx:   1, // Default to Gruvbox Light when asked for light scheme optimization!
+		themeIdx:   1, // Default Gruvbox Light
+		table:      tbl,
+		spinner:    sp,
+		progress:   prog,
+		help:       h,
+		keys:       newKeyMap(),
 	}
+
+	m.applyThemeStyles()
+	m.updateTableRows()
+	return m
+}
+
+func (m *model) applyThemeStyles() {
+	th := themes[m.themeIdx]
+
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(th.CardBorder).
+		BorderBottom(true).
+		Bold(true).
+		Foreground(th.DetailTitle)
+	s.Selected = s.Selected.
+		Foreground(th.HostText).
+		Background(th.CardBorder).
+		Bold(true)
+	m.table.SetStyles(s)
+
+	m.spinner.Style = lipgloss.NewStyle().Foreground(th.InputPrompt)
+	m.help.Styles.ShortKey = lipgloss.NewStyle().Foreground(th.FooterKey)
+	m.help.Styles.ShortDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
+	m.help.Styles.FullKey = lipgloss.NewStyle().Foreground(th.FooterKey)
+	m.help.Styles.FullDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
+}
+
+func (m *model) updateTableRows() {
+	th := themes[m.themeIdx]
+	rows := make([]table.Row, len(m.targets))
+	for i, t := range m.targets {
+		badge := renderBadge(t.Status, th)
+		spark := renderSparkline(t.Rtts, 20, th)
+
+		rttStr := "---"
+		if t.LastRtt > 0 && t.Status != "DOWN" {
+			rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())
+		}
+
+		avgStr := "---"
+		if t.AvgRtt > 0 {
+			avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+		}
+
+		lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
+
+		rows[i] = table.Row{
+			badge,
+			t.Host,
+			strconv.Itoa(t.Port),
+			spark,
+			rttStr,
+			avgStr,
+			lossStr,
+		}
+	}
+	m.table.SetRows(rows)
 }
 
 func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
-	cmds = append(cmds, tickCmd())
+	cmds = append(cmds, tickCmd(), m.spinner.Tick)
 
-	// Fire initial pings
 	for i, t := range m.targets {
 		cmds = append(cmds, pingHostCmd(i, t.Host, t.Port))
 	}
@@ -303,6 +470,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.help.Width = msg.Width
+		m.progress.Width = msg.Width - 25
+		if m.progress.Width < 10 {
+			m.progress.Width = 10
+		}
 
 	case tickMsg:
 		if !m.paused {
@@ -315,7 +487,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pingResultMsg:
 		if msg.index >= 0 && msg.index < len(m.targets) {
 			m.targets[msg.index].AddResult(msg.rtt, msg.err)
+			m.updateTableRows()
 		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
 
 	case tea.KeyMsg:
 		if m.addingHost {
@@ -333,6 +511,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.targets = append(m.targets, newTarget(host, port))
+					m.updateTableRows()
 					newIdx := len(m.targets) - 1
 					cmds = append(cmds, pingHostCmd(newIdx, host, port))
 					m.statusMsg = fmt.Sprintf("Added target %s:%d", host, port)
@@ -354,36 +533,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
-		switch msg.String() {
-		case "q", "ctrl+c":
+		switch {
+		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
 
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-
-		case "down", "j":
-			if m.cursor < len(m.targets)-1 {
-				m.cursor++
-			}
-
-		case "a":
+		case key.Matches(msg, m.keys.Add):
 			m.addingHost = true
 			m.inputField.Focus()
 			return m, textinput.Blink
 
-		case "d":
-			if len(m.targets) > 0 {
-				removed := m.targets[m.cursor].Host
-				m.targets = append(m.targets[:m.cursor], m.targets[m.cursor+1:]...)
-				if m.cursor >= len(m.targets) && m.cursor > 0 {
-					m.cursor--
-				}
+		case key.Matches(msg, m.keys.Delete):
+			cursor := m.table.Cursor()
+			if len(m.targets) > 0 && cursor < len(m.targets) {
+				removed := m.targets[cursor].Host
+				m.targets = append(m.targets[:cursor], m.targets[cursor+1:]...)
+				m.updateTableRows()
 				m.statusMsg = fmt.Sprintf("Removed target %s", removed)
 			}
 
-		case "space", " ":
+		case key.Matches(msg, m.keys.Pause):
 			m.paused = !m.paused
 			if m.paused {
 				m.statusMsg = "Pings paused"
@@ -391,11 +559,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "Resumed pings"
 			}
 
-		case "t":
+		case key.Matches(msg, m.keys.Theme):
 			m.themeIdx = (m.themeIdx + 1) % len(themes)
+			m.applyThemeStyles()
+			m.updateTableRows()
 			m.statusMsg = fmt.Sprintf("Switched theme to: %s", themes[m.themeIdx].Name)
 
-		case "r":
+		case key.Matches(msg, m.keys.Reset):
 			for i := range m.targets {
 				m.targets[i].Sent = 0
 				m.targets[i].Received = 0
@@ -405,7 +575,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.targets[i].AvgRtt = 0
 				m.targets[i].Status = "PENDING"
 			}
+			m.updateTableRows()
 			m.statusMsg = "Stats reset"
+
+		case key.Matches(msg, m.keys.Help):
+			m.help.ShowAll = !m.help.ShowAll
+
+		default:
+			// Let table handle navigation (up/down/j/k)
+			var cmd tea.Cmd
+			m.table, cmd = m.table.Update(msg)
+			cmds = append(cmds, cmd)
 		}
 	}
 
@@ -429,7 +609,7 @@ func renderSparkline(rtts []time.Duration, width int, th Theme) string {
 	}
 
 	for _, rtt := range slice {
-		if rtt < 0 { // Timeout / Error
+		if rtt < 0 {
 			sb.WriteString(lipgloss.NewStyle().Foreground(th.SparklineRed).Render("✕"))
 			continue
 		}
@@ -473,81 +653,41 @@ func (m model) View() string {
 
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(th.TitleFg).Background(th.TitleBg).Padding(0, 1)
 	subTitleStyle := lipgloss.NewStyle().Foreground(th.SubTitle).Italic(true)
-	cardStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(th.CardBorder).Padding(0, 1).MarginBottom(0)
-	selectedCardStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(th.SelCardBorder).Padding(0, 1)
 	statLabel := lipgloss.NewStyle().Foreground(th.StatLabel)
 	statVal := lipgloss.NewStyle().Bold(true).Foreground(th.StatVal)
 
-	// Header
+	// Header with animated Spinner
+	spinStr := ""
+	if !m.paused {
+		spinStr = m.spinner.View() + " "
+	}
 	pauseState := ""
 	if m.paused {
 		pauseState = " [PAUSED]"
 	}
-	header := titleStyle.Render("📡 VISUAL PING DASHBOARD") + subTitleStyle.Render(fmt.Sprintf("  %d targets | Theme: %s%s", len(m.targets), th.Name, pauseState))
+	header := titleStyle.Render("📡 VISUAL PING DASHBOARD") + subTitleStyle.Render(fmt.Sprintf("  %s%d targets | Theme: %s%s", spinStr, len(m.targets), th.Name, pauseState))
 	doc.WriteString(header + "\n\n")
 
-	// Host cards/rows
-	sparklineWidth := 20
-	if m.width > 80 {
-		sparklineWidth = 30
-	}
-
-	for i, t := range m.targets {
-		cursorStr := "  "
-		style := cardStyle
-		if i == m.cursor {
-			cursorStr = "❯ "
-			style = selectedCardStyle
-		}
-
-		badge := renderBadge(t.Status, th)
-		sparkline := renderSparkline(t.Rtts, sparklineWidth, th)
-
-		rttStr := "---"
-		if t.LastRtt > 0 && t.Status != "DOWN" {
-			rttStr = fmt.Sprintf("%3d ms", t.LastRtt.Milliseconds())
-		}
-
-		avgStr := "---"
-		if t.AvgRtt > 0 {
-			avgStr = fmt.Sprintf("%3d ms", t.AvgRtt.Milliseconds())
-		}
-
-		lossStr := fmt.Sprintf("%5.1f%% loss", t.LossPercentage())
-		lossColor := th.SparklineGreen
-		if t.LossPercentage() > 0 {
-			lossColor = th.SparklineRed
-		}
-		styledLoss := lipgloss.NewStyle().Foreground(lossColor).Render(lossStr)
-
-		hostInfo := fmt.Sprintf("%-18s :%-5d", t.Host, t.Port)
-
-		rowContent := fmt.Sprintf("%s %s  %s  [%s]  RTT: %s | Avg: %s | Loss: %s",
-			cursorStr,
-			badge,
-			lipgloss.NewStyle().Bold(true).Foreground(th.HostText).Render(hostInfo),
-			sparkline,
-			statVal.Render(rttStr),
-			statVal.Render(avgStr),
-			styledLoss,
-		)
-
-		doc.WriteString(style.Render(rowContent) + "\n")
-	}
+	// Table View
+	doc.WriteString(m.table.View() + "\n")
 
 	// Details Panel for Selected Target
-	if len(m.targets) > 0 && m.cursor < len(m.targets) {
-		selected := m.targets[m.cursor]
+	cursor := m.table.Cursor()
+	if len(m.targets) > 0 && cursor < len(m.targets) {
+		selected := m.targets[cursor]
 		doc.WriteString("\n")
 
 		detailTitle := lipgloss.NewStyle().Bold(true).Foreground(th.DetailTitle).Render(fmt.Sprintf("Target Details: %s:%d", selected.Host, selected.Port))
 
-		stats := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %d/%d",
+		lossVal := selected.LossPercentage()
+		lossProgressBar := m.progress.ViewAs(lossVal / 100.0)
+
+		stats := fmt.Sprintf("%s %s   %s %s   %s %s   %s %d/%d\n%s %s %.1f%%",
 			statLabel.Render("Min:"), statVal.Render(fmt.Sprintf("%dms", selected.MinRtt.Milliseconds())),
 			statLabel.Render("Max:"), statVal.Render(fmt.Sprintf("%dms", selected.MaxRtt.Milliseconds())),
 			statLabel.Render("Avg:"), statVal.Render(fmt.Sprintf("%dms", selected.AvgRtt.Milliseconds())),
-			statLabel.Render("Loss:"), statVal.Render(fmt.Sprintf("%.1f%%", selected.LossPercentage())),
 			statLabel.Render("Sent/Recv:"), selected.Sent, selected.Received,
+			statLabel.Render("Loss:"), lossProgressBar, lossVal,
 		)
 
 		if selected.LastError != "" {
@@ -578,20 +718,8 @@ func (m model) View() string {
 		doc.WriteString("\n")
 	}
 
-	// Footer Help Bar
-	footerKey := lipgloss.NewStyle().Foreground(th.FooterKey)
-	footerDesc := lipgloss.NewStyle().Foreground(th.FooterDesc)
-
-	helpBar := fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
-		footerKey.Render("j/k/↑↓"), footerDesc.Render("select"),
-		footerKey.Render("a"), footerDesc.Render("add host"),
-		footerKey.Render("d"), footerDesc.Render("delete host"),
-		footerKey.Render("t"), footerDesc.Render("theme"),
-		footerKey.Render("space"), footerDesc.Render("pause"),
-		footerKey.Render("r"), footerDesc.Render("reset"),
-		footerKey.Render("q"), footerDesc.Render("quit"),
-	)
-	doc.WriteString(helpBar + "\n")
+	// Adaptive Bubbles Help Footer
+	doc.WriteString(m.help.View(m.keys) + "\n")
 
 	return doc.String()
 }
