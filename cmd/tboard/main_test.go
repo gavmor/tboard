@@ -61,7 +61,7 @@ targets:
 }
 
 func TestTargetLossPercentage(t *testing.T) {
-	target := newTarget("1.1.1.1", 53)
+	target := newTarget("1.1.1.1", 53, 50, 10)
 	if target.LossPercentage() != 0.0 {
 		t.Errorf("expected 0%% loss for 0 sent, got %f", target.LossPercentage())
 	}
@@ -78,7 +78,7 @@ func TestTargetLossPercentage(t *testing.T) {
 }
 
 func TestTargetAddResult(t *testing.T) {
-	target := newTarget("google.com", 443)
+	target := newTarget("google.com", 443, 50, 10)
 
 	target.AddResult(30*time.Millisecond, nil)
 	if target.Status != "UP" {
@@ -107,7 +107,7 @@ func TestTargetAddResult(t *testing.T) {
 
 func TestRenderBadge(t *testing.T) {
 	statuses := []string{"UP", "SLOW", "DOWN", "PENDING"}
-	th := themes[1] // Gruvbox Light
+	th := themes[1]
 	for _, st := range statuses {
 		badge := renderBadge(st, th)
 		if badge == "" {
@@ -139,14 +139,21 @@ func TestRenderTable(t *testing.T) {
 	}
 }
 
-func TestModelBubblesComponents(t *testing.T) {
+func TestModelBubblesAndNtcharts(t *testing.T) {
 	m := initialModel(nil, 1)
 	if len(m.targets) != 5 {
 		t.Fatalf("expected 5 default targets, got %d", len(m.targets))
 	}
 
+	// Test View Mode toggle key 'v' / 'tab'
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	m = updated.(model)
+	if m.viewMode != ViewExpandedChart {
+		t.Errorf("expected viewMode ViewExpandedChart after pressing 'v', got %v", m.viewMode)
+	}
+
 	// Test theme key 't'
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	m = updated.(model)
 	if m.themeIdx != 2 {
 		t.Errorf("expected themeIdx 2 after pressing 't', got %d", m.themeIdx)

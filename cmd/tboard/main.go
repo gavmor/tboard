@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimbleMarkets/ntcharts/linechart/streamlinechart"
+	"github.com/NimbleMarkets/ntcharts/sparkline"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"
@@ -54,14 +56,23 @@ type Target struct {
 	AvgRtt    time.Duration
 	Status    string // "UP", "SLOW", "DOWN", "PENDING"
 	LastError string
+
+	// ntcharts models
+	Chart     streamlinechart.Model
+	Sparkline sparkline.Model
 }
 
-func newTarget(host string, port int) Target {
+func newTarget(host string, port int, chartWidth, chartHeight int) Target {
+	stChart := streamlinechart.New(chartWidth, chartHeight)
+	spChart := sparkline.New(16, 1)
+
 	return Target{
-		Host:    host,
-		Port:    port,
-		Samples: make([]Sample, 0, 180),
-		Status:  "PENDING",
+		Host:      host,
+		Port:      port,
+		Samples:   make([]Sample, 0, 180),
+		Status:    "PENDING",
+		Chart:     stChart,
+		Sparkline: spChart,
 	}
 }
 
@@ -78,7 +89,6 @@ func parseHostPort(raw string, defaultPort int) (string, int) {
 				return host, p
 			}
 		}
-		// Fallback split if net.SplitHostPort fails (e.g. no ipv6 brackets)
 		parts := strings.Split(raw, ":")
 		if len(parts) == 2 {
 			if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
@@ -112,11 +122,17 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 		t.LastError = err.Error()
 		sample.Rtt = -1
 		t.Status = "DOWN"
+		t.Chart.Push(0)
+		t.Sparkline.Push(0)
 	} else {
 		t.Received++
 		t.LastRtt = rtt
 		sample.Rtt = rtt
 		t.LastError = ""
+
+		ms := float64(rtt.Milliseconds())
+		t.Chart.Push(ms)
+		t.Sparkline.Push(ms)
 
 		if t.MinRtt == 0 || rtt < t.MinRtt {
 			t.MinRtt = rtt
@@ -144,23 +160,34 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 		}
 	}
 
+	t.Chart.Draw()
+	t.Sparkline.Draw()
+
 	t.Samples = append(t.Samples, sample)
 	if len(t.Samples) > maxHistory {
 		t.Samples = t.Samples[1:]
 	}
 }
 
+type ViewMode int
+
+const (
+	ViewSplit ViewMode = iota
+	ViewExpandedChart
+)
+
 // KeyMap defines keybindings using bubbles/key
 type keyMap struct {
-	Up     key.Binding
-	Down   key.Binding
-	Add    key.Binding
-	Delete key.Binding
-	Theme  key.Binding
-	Pause  key.Binding
-	Reset  key.Binding
-	Help   key.Binding
-	Quit   key.Binding
+	Up         key.Binding
+	Down       key.Binding
+	Add        key.Binding
+	Delete     key.Binding
+	ToggleView key.Binding
+	Theme      key.Binding
+	Pause      key.Binding
+	Reset      key.Binding
+	Help       key.Binding
+	Quit       key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -180,6 +207,10 @@ func newKeyMap() keyMap {
 		Delete: key.NewBinding(
 			key.WithKeys("d"),
 			key.WithHelp("d", "delete"),
+		),
+		ToggleView: key.NewBinding(
+			key.WithKeys("tab", "v"),
+			key.WithHelp("tab/v", "toggle chart view"),
 		),
 		Theme: key.NewBinding(
 			key.WithKeys("t"),
@@ -205,14 +236,13 @@ func newKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Add, k.Delete, k.Theme, k.Pause, k.Reset, k.Help, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.ToggleView, k.Add, k.Delete, k.Theme, k.Pause, k.Help, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Add, k.Delete},
-		{k.Theme, k.Pause, k.Reset},
-		{k.Help, k.Quit},
+		{k.Up, k.Down, k.ToggleView, k.Add, k.Delete},
+		{k.Theme, k.Pause, k.Reset, k.Help, k.Quit},
 	}
 }
 
@@ -562,27 +592,28 @@ type model struct {
 	inputField textinput.Model
 	statusMsg  string
 	themeIdx   int
+	viewMode   ViewMode
 
-	// Bubbles Components
+	// Bubbles & ntcharts Components
 	spinner  spinner.Model
 	progress progress.Model
 	help     help.Model
 	keys     keyMap
 }
 
-func initialModel(targets []Target, themeIdx int) model {
+func initialModel(initialTargets []Target, themeIdx int) model {
 	ti := textinput.New()
 	ti.Placeholder = "example.com:80"
 	ti.CharLimit = 64
 	ti.Width = 30
 
-	if len(targets) == 0 {
-		targets = []Target{
-			newTarget("1.1.1.1", 53),
-			newTarget("8.8.8.8", 53),
-			newTarget("google.com", 443),
-			newTarget("github.com", 443),
-			newTarget("127.0.0.1", 80),
+	if len(initialTargets) == 0 {
+		initialTargets = []Target{
+			newTarget("1.1.1.1", 53, 50, 10),
+			newTarget("8.8.8.8", 53, 50, 10),
+			newTarget("google.com", 443, 50, 10),
+			newTarget("github.com", 443, 50, 10),
+			newTarget("127.0.0.1", 80, 50, 10),
 		}
 	}
 
@@ -597,15 +628,17 @@ func initialModel(targets []Target, themeIdx int) model {
 	h := help.New()
 
 	m := model{
-		targets:    targets,
+		targets:    initialTargets,
 		cursor:     0,
 		paused:     false,
 		inputField: ti,
 		themeIdx:   themeIdx,
+		viewMode:   ViewSplit,
 		spinner:    sp,
 		progress:   prog,
 		help:       h,
 		keys:       newKeyMap(),
+		statusMsg:  "Monitoring active (ntcharts streaming enabled)",
 	}
 
 	m.applyThemeStyles()
@@ -619,6 +652,29 @@ func (m *model) applyThemeStyles() {
 	m.help.Styles.ShortDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
 	m.help.Styles.FullKey = lipgloss.NewStyle().Foreground(th.FooterKey)
 	m.help.Styles.FullDesc = lipgloss.NewStyle().Foreground(th.FooterDesc)
+}
+
+func (m *model) resizeCharts() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	chartW := m.width - 44
+	if chartW < 20 {
+		chartW = 20
+	}
+	chartH := 10
+	if m.viewMode == ViewExpandedChart {
+		chartW = m.width - 6
+		chartH = m.height - 10
+		if chartH < 6 {
+			chartH = 6
+		}
+	}
+
+	for i := range m.targets {
+		m.targets[i].Chart.Resize(chartW, chartH)
+		m.targets[i].Chart.Draw()
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -644,6 +700,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.progress.Width < 10 {
 			m.progress.Width = 10
 		}
+		m.resizeCharts()
 
 	case tickMsg:
 		if !m.paused {
@@ -670,7 +727,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				val := strings.TrimSpace(m.inputField.Value())
 				if val != "" {
 					host, port := parseHostPort(val, 80)
-					m.targets = append(m.targets, newTarget(host, port))
+					chartW := m.width - 44
+					if chartW < 30 {
+						chartW = 30
+					}
+					nt := newTarget(host, port, chartW, 10)
+					m.targets = append(m.targets, nt)
 					newIdx := len(m.targets) - 1
 					cmds = append(cmds, pingHostCmd(newIdx, host, port))
 					m.statusMsg = fmt.Sprintf("Added target %s:%d", host, port)
@@ -705,6 +767,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.targets)-1 {
 				m.cursor++
 			}
+
+		case key.Matches(msg, m.keys.ToggleView):
+			if m.viewMode == ViewSplit {
+				m.viewMode = ViewExpandedChart
+				m.statusMsg = "Switched to Expanded ntcharts View"
+			} else {
+				m.viewMode = ViewSplit
+				m.statusMsg = "Switched to Split View"
+			}
+			m.resizeCharts()
 
 		case key.Matches(msg, m.keys.Add):
 			m.addingHost = true
@@ -743,8 +815,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.targets[i].MaxRtt = 0
 				m.targets[i].AvgRtt = 0
 				m.targets[i].Status = "PENDING"
+				chartW := m.width - 44
+				if chartW < 30 {
+					chartW = 30
+				}
+				m.targets[i].Chart = streamlinechart.New(chartW, 10)
+				m.targets[i].Sparkline = sparkline.New(16, 1)
 			}
-			m.statusMsg = "Stats reset"
+			m.statusMsg = "Stats & Charts reset"
 
 		case key.Matches(msg, m.keys.Help):
 			m.help.ShowAll = !m.help.ShowAll
@@ -815,16 +893,75 @@ func (m model) renderTable() string {
 	return sb.String()
 }
 
+func (m model) renderChartPanel(t Target) string {
+	th := themes[m.themeIdx]
+
+	chartTitle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(th.DetailTitle).
+		Render(fmt.Sprintf("📊 Live Latency Stream (ntcharts) - %s:%d", t.Host, t.Port))
+
+	chartStr := t.Chart.View()
+	if strings.TrimSpace(chartStr) == "" {
+		chartStr = lipgloss.NewStyle().Foreground(th.StatLabel).Render("Waiting for ping samples...")
+	}
+
+	lossPct := t.LossPercentage() / 100.0
+	lossBar := m.progress.ViewAs(lossPct)
+
+	minMs, maxMs, avgMs, lastMs := "---", "---", "---", "---"
+	if t.MinRtt > 0 {
+		minMs = fmt.Sprintf("%d ms", t.MinRtt.Milliseconds())
+	}
+	if t.MaxRtt > 0 {
+		maxMs = fmt.Sprintf("%d ms", t.MaxRtt.Milliseconds())
+	}
+	if t.AvgRtt > 0 {
+		avgMs = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+	}
+	if t.LastRtt > 0 && t.Status != "DOWN" {
+		lastMs = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())
+	}
+
+	statsBox := fmt.Sprintf(
+		"Status: %s  |  Last: %s  |  Min: %s  |  Max: %s  |  Avg: %s\n"+
+			"Packets: Sent %d, Recv %d, Lost %d (%.1f%%)\nLoss: %s",
+		t.Status, lastMs, minMs, maxMs, avgMs,
+		t.Sent, t.Received, t.Sent-t.Received, t.LossPercentage(), lossBar,
+	)
+
+	if t.LastError != "" {
+		statsBox += fmt.Sprintf("\n%s", lipgloss.NewStyle().Foreground(th.LastError).Render("Error: "+t.LastError))
+	}
+
+	panelContent := lipgloss.JoinVertical(lipgloss.Left,
+		chartTitle,
+		chartStr,
+		lipgloss.NewStyle().Foreground(th.CardBorder).Render("──────────────────────────────────────────────────"),
+		statsBox,
+	)
+
+	borderCol := th.DetailBorder
+	if t.Status == "SLOW" {
+		borderCol = th.BadgeSlowBg
+	} else if t.Status == "DOWN" {
+		borderCol = th.BadgeDownBg
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderCol).
+		Padding(0, 1).
+		Render(panelContent)
+}
+
 func (m model) View() string {
 	th := themes[m.themeIdx]
 	var doc strings.Builder
 
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(th.TitleFg).Background(th.TitleBg).Padding(0, 1)
 	subTitleStyle := lipgloss.NewStyle().Foreground(th.SubTitle).Italic(true)
-	statLabel := lipgloss.NewStyle().Foreground(th.StatLabel)
-	statVal := lipgloss.NewStyle().Bold(true).Foreground(th.StatVal)
 
-	// Header with animated Spinner
 	spinStr := ""
 	if !m.paused {
 		spinStr = m.spinner.View() + " "
@@ -833,50 +970,34 @@ func (m model) View() string {
 	if m.paused {
 		pauseState = " [PAUSED]"
 	}
-	header := titleStyle.Render("📡 VISUAL PING DASHBOARD") + subTitleStyle.Render(fmt.Sprintf("  %s%d targets | Theme: %s%s", spinStr, len(m.targets), th.Name, pauseState))
-	doc.WriteString(header + "\n\n")
 
-	// Table View
-	doc.WriteString(m.renderTable() + "\n")
-
-	// Details Panel for Selected Target
-	if len(m.targets) > 0 && m.cursor < len(m.targets) {
-		selected := m.targets[m.cursor]
-		doc.WriteString("\n")
-
-		detailTitle := lipgloss.NewStyle().Bold(true).Foreground(th.DetailTitle).Render(fmt.Sprintf("Target Details: %s:%d", selected.Host, selected.Port))
-
-		lossVal := selected.LossPercentage()
-		lossProgressBar := m.progress.ViewAs(lossVal / 100.0)
-
-		stats := fmt.Sprintf("%s %s   %s %s   %s %s   %s %d/%d\n%s %s %.1f%%",
-			statLabel.Render("Min:"), statVal.Render(fmt.Sprintf("%dms", selected.MinRtt.Milliseconds())),
-			statLabel.Render("Max:"), statVal.Render(fmt.Sprintf("%dms", selected.MaxRtt.Milliseconds())),
-			statLabel.Render("Avg:"), statVal.Render(fmt.Sprintf("%dms", selected.AvgRtt.Milliseconds())),
-			statLabel.Render("Sent/Recv:"), selected.Sent, selected.Received,
-			statLabel.Render("Loss:"), lossProgressBar, lossVal,
-		)
-
-		if selected.LastError != "" {
-			stats += "\n" + lipgloss.NewStyle().Foreground(th.LastError).Render("Last Error: "+selected.LastError)
-		}
-
-		detailWidth := m.width - 4
-		if detailWidth < 40 {
-			detailWidth = 40
-		}
-
-		detailBox := lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(th.DetailBorder).
-			Padding(0, 1).
-			Width(detailWidth).
-			Render(detailTitle + "\n" + stats)
-
-		doc.WriteString(detailBox + "\n")
+	viewName := "Split View"
+	if m.viewMode == ViewExpandedChart {
+		viewName = "Expanded Chart"
 	}
 
-	// Add Host Input Modal / Line
+	header := titleStyle.Render("📡 VISUAL PING DASHBOARD") + subTitleStyle.Render(fmt.Sprintf("  %s%d targets | %s | Theme: %s%s", spinStr, len(m.targets), viewName, th.Name, pauseState))
+	doc.WriteString(header + "\n\n")
+
+	var selectedTarget Target
+	if len(m.targets) > 0 && m.cursor >= 0 && m.cursor < len(m.targets) {
+		selectedTarget = m.targets[m.cursor]
+	}
+
+	if m.viewMode == ViewExpandedChart {
+		if len(m.targets) > 0 {
+			doc.WriteString(m.renderChartPanel(selectedTarget) + "\n")
+		} else {
+			doc.WriteString(lipgloss.NewStyle().Foreground(th.LastError).Render("No targets configured. Press 'a' to add a host.") + "\n")
+		}
+	} else {
+		// Split View
+		doc.WriteString(m.renderTable() + "\n")
+		if len(m.targets) > 0 {
+			doc.WriteString(m.renderChartPanel(selectedTarget) + "\n")
+		}
+	}
+
 	if m.addingHost {
 		doc.WriteString("\n" + lipgloss.NewStyle().Foreground(th.InputPrompt).Render("Enter host to ping (host:port): ") + m.inputField.View() + "\n")
 	} else if m.statusMsg != "" {
@@ -885,7 +1006,6 @@ func (m model) View() string {
 		doc.WriteString("\n")
 	}
 
-	// Adaptive Bubbles Help Footer
 	doc.WriteString(m.help.View(m.keys) + "\n")
 
 	return doc.String()
@@ -902,7 +1022,6 @@ func loadConfigFile(path string) (*ConfigFile, error) {
 		return &cfg, nil
 	}
 
-	// Simple YAML / Line fallback parser if not JSON
 	lines := strings.Split(string(data), "\n")
 	cfg = ConfigFile{}
 	for _, line := range lines {
@@ -937,7 +1056,7 @@ func loadConfigFile(path string) (*ConfigFile, error) {
 }
 
 func printUsage() {
-	fmt.Printf("tboard v%s - Interactive visual ping dashboard TUI\n\n", version)
+	fmt.Printf("tboard v%s - Interactive visual ping dashboard TUI (ntcharts enabled)\n\n", version)
 	fmt.Println("Usage:")
 	fmt.Println("  tboard [flags] [host[:port] ...]")
 	fmt.Println("\nExamples:")
@@ -988,7 +1107,6 @@ func main() {
 	var targets []Target
 	selectedThemeIdx := parseThemeName(themeName)
 
-	// Attempt auto-loading config file if explicit config flag is not passed
 	if configFile == "" {
 		homeDir, _ := os.UserHomeDir()
 		candidates := []string{
@@ -1005,7 +1123,6 @@ func main() {
 		}
 	}
 
-	// Read config file if specified/found
 	if configFile != "" {
 		cfg, err := loadConfigFile(configFile)
 		if err == nil {
@@ -1020,7 +1137,7 @@ func main() {
 				if p <= 0 {
 					p = defaultPort
 				}
-				targets = append(targets, newTarget(ct.Host, p))
+				targets = append(targets, newTarget(ct.Host, p, 50, 10))
 			}
 		} else if configFile != "" && flag.Lookup("c").Value.String() != "" {
 			fmt.Fprintf(os.Stderr, "Error loading config file %s: %v\n", configFile, err)
@@ -1028,13 +1145,12 @@ func main() {
 		}
 	}
 
-	// Positional CLI host arguments (override/append targets)
 	posArgs := flag.Args()
 	if len(posArgs) > 0 {
 		cliTargets := make([]Target, 0, len(posArgs))
 		for _, arg := range posArgs {
 			host, port := parseHostPort(arg, defaultPort)
-			cliTargets = append(cliTargets, newTarget(host, port))
+			cliTargets = append(cliTargets, newTarget(host, port, 50, 10))
 		}
 		targets = cliTargets
 	}
