@@ -84,6 +84,21 @@ make run      # Runs tboard directly via mise
 
 ---
 
+## Automated Terminal Recording ([VHS](https://github.com/charmbracelet/vhs))
+
+`tboard` includes a [`demo.tape`](demo.tape) configuration for [Charm's VHS](https://github.com/charmbracelet/vhs) terminal recorder. You can automatically regenerate screenshots and animated GIFs of the TUI:
+
+```bash
+# Install Charm VHS
+go install github.com/charmbracelet/vhs@latest
+
+# Build binary and render demo recording
+make build
+vhs demo.tape
+```
+
+---
+
 ## License
 
 [MIT](LICENSE)
