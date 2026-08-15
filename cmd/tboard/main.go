@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +20,20 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+var version = "0.1.0"
+
+// Config File representation
+type ConfigFile struct {
+	Theme       string         `json:"theme"`
+	DefaultPort int            `json:"default_port"`
+	Targets     []ConfigTarget `json:"targets"`
+}
+
+type ConfigTarget struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
 
 // Sample records a latency measurement and its exact timestamp.
 type Sample struct {
@@ -48,6 +65,31 @@ func newTarget(host string, port int) Target {
 	}
 }
 
+func parseHostPort(raw string, defaultPort int) (string, int) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", defaultPort
+	}
+
+	if strings.Contains(raw, ":") {
+		host, portStr, err := net.SplitHostPort(raw)
+		if err == nil {
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+				return host, p
+			}
+		}
+		// Fallback split if net.SplitHostPort fails (e.g. no ipv6 brackets)
+		parts := strings.Split(raw, ":")
+		if len(parts) == 2 {
+			if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
+				return parts[0], p
+			}
+		}
+	}
+
+	return raw, defaultPort
+}
+
 // Packet loss percentage
 func (t Target) LossPercentage() float64 {
 	if t.Sent == 0 {
@@ -60,7 +102,7 @@ func (t Target) LossPercentage() float64 {
 // Add a ping measurement to the host history
 func (t *Target) AddResult(rtt time.Duration, err error) {
 	t.Sent++
-	const maxHistory = 180 // Up to 3 minutes of history
+	const maxHistory = 180
 
 	sample := Sample{
 		Timestamp: time.Now(),
@@ -299,7 +341,20 @@ var themes = []Theme{
 	},
 }
 
-// ANSI Color helper functions
+func parseThemeName(name string) int {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "auto", "adaptive":
+		return 0
+	case "gruvbox", "gruvbox-light", "light":
+		return 1
+	case "dracula", "dracula-dark", "dark":
+		return 2
+	default:
+		return 1
+	}
+}
+
 func colorToFGANSI(c lipgloss.TerminalColor) string {
 	switch v := c.(type) {
 	case lipgloss.Color:
@@ -348,8 +403,6 @@ func colorToBGANSI(c lipgloss.TerminalColor) string {
 	return ""
 }
 
-// renderSparkline applies logarithmic variable time-axis compression (C = 15.0).
-// Recent data (right) is spread out for high detail, while older data (left) is exponentially compressed.
 func renderSparkline(samples []Sample, width int, th Theme) string {
 	emptyFG := colorToFGANSI(th.SparklineEmpty)
 	greenFG := colorToFGANSI(th.SparklineGreen)
@@ -361,7 +414,7 @@ func renderSparkline(samples []Sample, width int, th Theme) string {
 	}
 
 	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
-	const compression = 15.0 // Logarithmic compression factor C
+	const compression = 15.0
 
 	now := time.Now()
 	oldestTime := samples[0].Timestamp
@@ -376,10 +429,8 @@ func renderSparkline(samples []Sample, width int, th Theme) string {
 		count    int
 	}
 	buckets := make([]bucket, width)
-
 	denom := math.Log(1.0 + compression)
 
-	// Map each timestamped sample into log-compressed x-coordinates
 	for _, s := range samples {
 		age := now.Sub(s.Timestamp)
 		if age < 0 {
@@ -390,7 +441,6 @@ func renderSparkline(samples []Sample, width int, th Theme) string {
 			ageRatio = 1.0
 		}
 
-		// Logarithmic distance from right edge (0.0 = right/now, 1.0 = left/oldest)
 		normDist := math.Log(1.0+compression*ageRatio) / denom
 		col := int(math.Round(float64(width-1) * (1.0 - normDist)))
 
@@ -406,11 +456,10 @@ func renderSparkline(samples []Sample, width int, th Theme) string {
 		if s.Rtt < 0 {
 			b.hasError = true
 		} else if s.Rtt > b.maxRtt {
-			b.maxRtt = s.Rtt // Peak-hold aggregation preserves spikes in compressed columns
+			b.maxRtt = s.Rtt
 		}
 	}
 
-	// Forward-fill empty gaps between sparse buckets
 	lastValid := bucket{maxRtt: 0, hasError: false, count: 0}
 	for i := 0; i < width; i++ {
 		if buckets[i].count > 0 {
@@ -449,7 +498,7 @@ func renderSparkline(samples []Sample, width int, th Theme) string {
 		sb.WriteRune(blocks[idx])
 	}
 
-	sb.WriteString("\x1b[39m") // Reset foreground color only
+	sb.WriteString("\x1b[39m")
 	return sb.String()
 }
 
@@ -521,40 +570,38 @@ type model struct {
 	keys     keyMap
 }
 
-func initialModel() model {
+func initialModel(targets []Target, themeIdx int) model {
 	ti := textinput.New()
 	ti.Placeholder = "example.com:80"
 	ti.CharLimit = 64
 	ti.Width = 30
 
-	defaultTargets := []Target{
-		newTarget("1.1.1.1", 53),
-		newTarget("8.8.8.8", 53),
-		newTarget("google.com", 443),
-		newTarget("github.com", 443),
-		newTarget("127.0.0.1", 80),
+	if len(targets) == 0 {
+		targets = []Target{
+			newTarget("1.1.1.1", 53),
+			newTarget("8.8.8.8", 53),
+			newTarget("google.com", 443),
+			newTarget("github.com", 443),
+			newTarget("127.0.0.1", 80),
+		}
 	}
 
-	// Spinner
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = lipgloss.NewStyle().Foreground(themes[1].InputPrompt)
 
-	// Progress
 	prog := progress.New(
 		progress.WithScaledGradient("#79740e", "#9d0006"),
 		progress.WithoutPercentage(),
 	)
 
-	// Help
 	h := help.New()
 
 	m := model{
-		targets:    defaultTargets,
+		targets:    targets,
 		cursor:     0,
 		paused:     false,
 		inputField: ti,
-		themeIdx:   1, // Default Gruvbox Light
+		themeIdx:   themeIdx,
 		spinner:    sp,
 		progress:   prog,
 		help:       h,
@@ -622,15 +669,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				val := strings.TrimSpace(m.inputField.Value())
 				if val != "" {
-					host := val
-					port := 80
-					if strings.Contains(val, ":") {
-						parts := strings.Split(val, ":")
-						host = parts[0]
-						if p, err := strconv.Atoi(parts[1]); err == nil {
-							port = p
-						}
-					}
+					host, port := parseHostPort(val, 80)
 					m.targets = append(m.targets, newTarget(host, port))
 					newIdx := len(m.targets) - 1
 					cmds = append(cmds, pingHostCmd(newIdx, host, port))
@@ -852,8 +891,155 @@ func (m model) View() string {
 	return doc.String()
 }
 
+func loadConfigFile(path string) (*ConfigFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg ConfigFile
+	if err := json.Unmarshal(data, &cfg); err == nil {
+		return &cfg, nil
+	}
+
+	// Simple YAML / Line fallback parser if not JSON
+	lines := strings.Split(string(data), "\n")
+	cfg = ConfigFile{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "theme:") {
+			cfg.Theme = strings.TrimSpace(strings.TrimPrefix(line, "theme:"))
+		} else if strings.HasPrefix(line, "default_port:") {
+			if p, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "default_port:"))); err == nil {
+				cfg.DefaultPort = p
+			}
+		} else if strings.HasPrefix(line, "- host:") || strings.HasPrefix(line, "- ") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				host := strings.TrimSpace(parts[1])
+				port := 80
+				if len(parts) >= 3 {
+					if p, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil {
+						port = p
+					}
+				}
+				if host != "" {
+					cfg.Targets = append(cfg.Targets, ConfigTarget{Host: host, Port: port})
+				}
+			}
+		}
+	}
+
+	return &cfg, nil
+}
+
+func printUsage() {
+	fmt.Printf("tboard v%s - Interactive visual ping dashboard TUI\n\n", version)
+	fmt.Println("Usage:")
+	fmt.Println("  tboard [flags] [host[:port] ...]")
+	fmt.Println("\nExamples:")
+	fmt.Println("  tboard 1.1.1.1 8.8.8.8 google.com:443")
+	fmt.Println("  tboard -c ~/.config/tboard/config.yaml")
+	fmt.Println("  tboard -t dracula 1.1.1.1 github.com")
+	fmt.Println("\nFlags:")
+	fmt.Println("  -c, --config <file>   Path to config file (.json or .yaml)")
+	fmt.Println("  -p, --port <port>     Default port when omitted (default: 80)")
+	fmt.Println("  -t, --theme <name>    Initial theme: gruvbox-light, dracula, auto")
+	fmt.Println("  -v, --version         Show version information")
+	fmt.Println("  -h, --help            Show help message")
+}
+
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	var (
+		configFile  string
+		defaultPort int
+		themeName   string
+		showVersion bool
+		showHelp    bool
+	)
+
+	flag.StringVar(&configFile, "c", "", "Path to config file")
+	flag.StringVar(&configFile, "config", "", "Path to config file")
+	flag.IntVar(&defaultPort, "p", 80, "Default target port")
+	flag.IntVar(&defaultPort, "port", 80, "Default target port")
+	flag.StringVar(&themeName, "t", "gruvbox-light", "Initial theme")
+	flag.StringVar(&themeName, "theme", "gruvbox-light", "Initial theme")
+	flag.BoolVar(&showVersion, "v", false, "Show version")
+	flag.BoolVar(&showVersion, "version", false, "Show version")
+	flag.BoolVar(&showHelp, "h", false, "Show help")
+	flag.BoolVar(&showHelp, "help", false, "Show help")
+
+	flag.Usage = printUsage
+	flag.Parse()
+
+	if showHelp {
+		printUsage()
+		os.Exit(0)
+	}
+
+	if showVersion {
+		fmt.Printf("tboard v%s\n", version)
+		os.Exit(0)
+	}
+
+	var targets []Target
+	selectedThemeIdx := parseThemeName(themeName)
+
+	// Attempt auto-loading config file if explicit config flag is not passed
+	if configFile == "" {
+		homeDir, _ := os.UserHomeDir()
+		candidates := []string{
+			"tboard.yaml",
+			"tboard.json",
+			filepath.Join(homeDir, ".config", "tboard", "config.yaml"),
+			filepath.Join(homeDir, ".config", "tboard", "config.json"),
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				configFile = c
+				break
+			}
+		}
+	}
+
+	// Read config file if specified/found
+	if configFile != "" {
+		cfg, err := loadConfigFile(configFile)
+		if err == nil {
+			if cfg.DefaultPort > 0 {
+				defaultPort = cfg.DefaultPort
+			}
+			if cfg.Theme != "" && themeName == "gruvbox-light" {
+				selectedThemeIdx = parseThemeName(cfg.Theme)
+			}
+			for _, ct := range cfg.Targets {
+				p := ct.Port
+				if p <= 0 {
+					p = defaultPort
+				}
+				targets = append(targets, newTarget(ct.Host, p))
+			}
+		} else if configFile != "" && flag.Lookup("c").Value.String() != "" {
+			fmt.Fprintf(os.Stderr, "Error loading config file %s: %v\n", configFile, err)
+			os.Exit(1)
+		}
+	}
+
+	// Positional CLI host arguments (override/append targets)
+	posArgs := flag.Args()
+	if len(posArgs) > 0 {
+		cliTargets := make([]Target, 0, len(posArgs))
+		for _, arg := range posArgs {
+			host, port := parseHostPort(arg, defaultPort)
+			cliTargets = append(cliTargets, newTarget(host, port))
+		}
+		targets = cliTargets
+	}
+
+	p := tea.NewProgram(initialModel(targets, selectedThemeIdx), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running ping dashboard: %v\n", err)
 		os.Exit(1)

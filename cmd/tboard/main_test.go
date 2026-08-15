@@ -2,11 +2,63 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestParseHostPort(t *testing.T) {
+	tests := []struct {
+		input        string
+		defaultPort  int
+		expectedHost string
+		expectedPort int
+	}{
+		{"google.com", 80, "google.com", 80},
+		{"1.1.1.1:53", 80, "1.1.1.1", 53},
+		{"github.com:443", 80, "github.com", 443},
+		{"10.0.0.1", 8080, "10.0.0.1", 8080},
+	}
+
+	for _, tt := range tests {
+		h, p := parseHostPort(tt.input, tt.defaultPort)
+		if h != tt.expectedHost || p != tt.expectedPort {
+			t.Errorf("parseHostPort(%q, %d) = (%q, %d), expected (%q, %d)",
+				tt.input, tt.defaultPort, h, p, tt.expectedHost, tt.expectedPort)
+		}
+	}
+}
+
+func TestLoadConfigFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test_config.yaml")
+
+	content := `
+theme: dracula
+default_port: 443
+targets:
+  - host: 1.1.1.1:53
+  - host: custom.domain.org
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create temp config file: %v", err)
+	}
+
+	cfg, err := loadConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("expected no error loading config file, got %v", err)
+	}
+
+	if cfg.Theme != "dracula" {
+		t.Errorf("expected theme 'dracula', got %s", cfg.Theme)
+	}
+	if cfg.DefaultPort != 443 {
+		t.Errorf("expected default port 443, got %d", cfg.DefaultPort)
+	}
+}
 
 func TestTargetLossPercentage(t *testing.T) {
 	target := newTarget("1.1.1.1", 53)
@@ -72,7 +124,7 @@ func TestRenderSparklineLogarithmicTime(t *testing.T) {
 		{Rtt: -1, Timestamp: now.Add(-10 * time.Second)},
 		{Rtt: 200 * time.Millisecond, Timestamp: now},
 	}
-	th := themes[1] // Gruvbox Light
+	th := themes[1]
 	sparkline := renderSparkline(samples, 20, th)
 	if sparkline == "" {
 		t.Error("expected non-empty sparkline rendering for timestamped samples")
@@ -80,7 +132,7 @@ func TestRenderSparklineLogarithmicTime(t *testing.T) {
 }
 
 func TestRenderTable(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil, 1)
 	tbl := m.renderTable()
 	if tbl == "" {
 		t.Error("expected non-empty table output")
@@ -88,7 +140,7 @@ func TestRenderTable(t *testing.T) {
 }
 
 func TestModelBubblesComponents(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil, 1)
 	if len(m.targets) != 5 {
 		t.Fatalf("expected 5 default targets, got %d", len(m.targets))
 	}
