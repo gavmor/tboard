@@ -56,21 +56,33 @@ type Target struct {
 	AvgRtt    time.Duration
 	Status    string // "UP", "SLOW", "DOWN", "PENDING"
 	LastError string
+	ColorHex  string // Theme color for 3D Z-stack rendering
 
 	// ntcharts models
 	Chart     streamlinechart.Model
 	Sparkline sparkline.Model
 }
 
-func newTarget(host string, port int, chartWidth, chartHeight int) Target {
+var targetPalette = []string{
+	"#8BE9FD", // Cyan
+	"#50FA7B", // Green
+	"#BD93F9", // Purple
+	"#FF79C6", // Pink
+	"#F1FA8C", // Yellow
+	"#FFB86C", // Orange
+}
+
+func newTarget(host string, port int, chartWidth, chartHeight int, colorIdx int) Target {
 	stChart := streamlinechart.New(chartWidth, chartHeight)
 	spChart := sparkline.New(16, 1)
+	color := targetPalette[colorIdx%len(targetPalette)]
 
 	return Target{
 		Host:      host,
 		Port:      port,
 		Samples:   make([]Sample, 0, 180),
 		Status:    "PENDING",
+		ColorHex:  color,
 		Chart:     stChart,
 		Sparkline: spChart,
 	}
@@ -172,8 +184,18 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 type ViewMode int
 
 const (
-	ViewSplit ViewMode = iota
+	View3DStack ViewMode = iota
+	ViewSplit
 	ViewExpandedChart
+)
+
+type FillStyle int
+
+const (
+	FillSolid FillStyle = iota
+	FillMedium
+	FillLight
+	FillWireframe
 )
 
 // KeyMap defines keybindings using bubbles/key
@@ -183,6 +205,13 @@ type keyMap struct {
 	Add        key.Binding
 	Delete     key.Binding
 	ToggleView key.Binding
+	CamUp      key.Binding
+	CamDown    key.Binding
+	CamLeft    key.Binding
+	CamRight   key.Binding
+	ScaleUp    key.Binding
+	ScaleDown  key.Binding
+	ToggleMesh key.Binding
 	Theme      key.Binding
 	Pause      key.Binding
 	Reset      key.Binding
@@ -193,24 +222,52 @@ type keyMap struct {
 func newKeyMap() keyMap {
 	return keyMap{
 		Up: key.NewBinding(
-			key.WithKeys("up", "k"),
-			key.WithHelp("k/↑", "up"),
+			key.WithKeys("k"),
+			key.WithHelp("k", "up"),
 		),
 		Down: key.NewBinding(
-			key.WithKeys("down", "j"),
-			key.WithHelp("j/↓", "down"),
+			key.WithKeys("j"),
+			key.WithHelp("j", "down"),
 		),
 		Add: key.NewBinding(
 			key.WithKeys("a"),
 			key.WithHelp("a", "add host"),
 		),
 		Delete: key.NewBinding(
-			key.WithKeys("d"),
-			key.WithHelp("d", "delete"),
+			key.WithKeys("x"),
+			key.WithHelp("x", "delete host"),
 		),
 		ToggleView: key.NewBinding(
 			key.WithKeys("tab", "v"),
-			key.WithHelp("tab/v", "toggle chart view"),
+			key.WithHelp("tab/v", "cycle view mode"),
+		),
+		CamUp: key.NewBinding(
+			key.WithKeys("w", "up"),
+			key.WithHelp("w/↑", "3D Z-depth +"),
+		),
+		CamDown: key.NewBinding(
+			key.WithKeys("s", "down"),
+			key.WithHelp("s/↓", "3D Z-depth -"),
+		),
+		CamLeft: key.NewBinding(
+			key.WithKeys("left"),
+			key.WithHelp("←", "3D X-slant -"),
+		),
+		CamRight: key.NewBinding(
+			key.WithKeys("right"),
+			key.WithHelp("→", "3D X-slant +"),
+		),
+		ScaleUp: key.NewBinding(
+			key.WithKeys("+", "="),
+			key.WithHelp("+", "3D height +"),
+		),
+		ScaleDown: key.NewBinding(
+			key.WithKeys("-", "_"),
+			key.WithHelp("-", "3D height -"),
+		),
+		ToggleMesh: key.NewBinding(
+			key.WithKeys("m"),
+			key.WithHelp("m", "3D fill style"),
 		),
 		Theme: key.NewBinding(
 			key.WithKeys("t"),
@@ -236,13 +293,14 @@ func newKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.ToggleView, k.Add, k.Delete, k.Theme, k.Pause, k.Help, k.Quit}
+	return []key.Binding{k.ToggleView, k.CamUp, k.CamDown, k.ScaleUp, k.ToggleMesh, k.Theme, k.Help, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.ToggleView, k.Add, k.Delete},
-		{k.Theme, k.Pause, k.Reset, k.Help, k.Quit},
+		{k.ToggleView, k.Add, k.Delete, k.Theme, k.Pause},
+		{k.CamUp, k.CamDown, k.CamLeft, k.CamRight},
+		{k.ScaleUp, k.ScaleDown, k.ToggleMesh, k.Reset, k.Quit},
 	}
 }
 
@@ -594,6 +652,12 @@ type model struct {
 	themeIdx   int
 	viewMode   ViewMode
 
+	// 3D Isometric Ridgeline Stack Camera Parameters
+	depthX    int
+	depthY    int
+	scaleY    float64
+	fillStyle FillStyle
+
 	// Bubbles & ntcharts Components
 	spinner  spinner.Model
 	progress progress.Model
@@ -609,11 +673,11 @@ func initialModel(initialTargets []Target, themeIdx int) model {
 
 	if len(initialTargets) == 0 {
 		initialTargets = []Target{
-			newTarget("1.1.1.1", 53, 50, 10),
-			newTarget("8.8.8.8", 53, 50, 10),
-			newTarget("google.com", 443, 50, 10),
-			newTarget("github.com", 443, 50, 10),
-			newTarget("127.0.0.1", 80, 50, 10),
+			newTarget("1.1.1.1", 53, 50, 10, 0),
+			newTarget("8.8.8.8", 53, 50, 10, 1),
+			newTarget("google.com", 443, 50, 10, 2),
+			newTarget("github.com", 443, 50, 10, 3),
+			newTarget("127.0.0.1", 80, 50, 10, 4),
 		}
 	}
 
@@ -633,12 +697,16 @@ func initialModel(initialTargets []Target, themeIdx int) model {
 		paused:     false,
 		inputField: ti,
 		themeIdx:   themeIdx,
-		viewMode:   ViewSplit,
+		viewMode:   View3DStack, // Default to 3D Ridgeline Stack
+		depthX:     3,
+		depthY:     2,
+		scaleY:     0.12,
+		fillStyle:  FillSolid,
 		spinner:    sp,
 		progress:   prog,
 		help:       h,
 		keys:       newKeyMap(),
-		statusMsg:  "Monitoring active (ntcharts streaming enabled)",
+		statusMsg:  "3D Z-Axis Ridgeline Stack View Active",
 	}
 
 	m.applyThemeStyles()
@@ -728,10 +796,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if val != "" {
 					host, port := parseHostPort(val, 80)
 					chartW := m.width - 44
-					if chartW < 30 {
-						chartW = 30
+					if chartW < 20 {
+						chartW = 20
 					}
-					nt := newTarget(host, port, chartW, 10)
+					nt := newTarget(host, port, chartW, 10, len(m.targets))
 					m.targets = append(m.targets, nt)
 					newIdx := len(m.targets) - 1
 					cmds = append(cmds, pingHostCmd(newIdx, host, port))
@@ -769,14 +837,68 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case key.Matches(msg, m.keys.ToggleView):
-			if m.viewMode == ViewSplit {
-				m.viewMode = ViewExpandedChart
+			m.viewMode = (m.viewMode + 1) % 3
+			switch m.viewMode {
+			case View3DStack:
+				m.statusMsg = "Switched to 3D Z-Axis Ridgeline Stack View"
+			case ViewSplit:
+				m.statusMsg = "Switched to Split Table/Chart View"
+			case ViewExpandedChart:
 				m.statusMsg = "Switched to Expanded ntcharts View"
-			} else {
-				m.viewMode = ViewSplit
-				m.statusMsg = "Switched to Split View"
 			}
 			m.resizeCharts()
+
+		case key.Matches(msg, m.keys.CamUp):
+			m.depthY++
+			if m.depthY > 6 {
+				m.depthY = 6
+			}
+			m.statusMsg = fmt.Sprintf("3D Depth Y: %d", m.depthY)
+
+		case key.Matches(msg, m.keys.CamDown):
+			m.depthY--
+			if m.depthY < 0 {
+				m.depthY = 0
+			}
+			m.statusMsg = fmt.Sprintf("3D Depth Y: %d", m.depthY)
+
+		case key.Matches(msg, m.keys.CamLeft):
+			m.depthX--
+			if m.depthX < 0 {
+				m.depthX = 0
+			}
+			m.statusMsg = fmt.Sprintf("3D Slant X: %d", m.depthX)
+
+		case key.Matches(msg, m.keys.CamRight):
+			m.depthX++
+			if m.depthX > 8 {
+				m.depthX = 8
+			}
+			m.statusMsg = fmt.Sprintf("3D Slant X: %d", m.depthX)
+
+		case key.Matches(msg, m.keys.ScaleUp):
+			m.scaleY *= 1.25
+			if m.scaleY > 1.5 {
+				m.scaleY = 1.5
+			}
+			m.statusMsg = fmt.Sprintf("3D Height Scale: %.2f", m.scaleY)
+
+		case key.Matches(msg, m.keys.ScaleDown):
+			m.scaleY /= 1.25
+			if m.scaleY < 0.02 {
+				m.scaleY = 0.02
+			}
+			m.statusMsg = fmt.Sprintf("3D Height Scale: %.2f", m.scaleY)
+
+		case key.Matches(msg, m.keys.ToggleMesh):
+			m.fillStyle = (m.fillStyle + 1) % 4
+			names := map[FillStyle]string{
+				FillSolid:     "Solid Block (█)",
+				FillMedium:    "Medium Shade (▓)",
+				FillLight:     "Light Shade (▒)",
+				FillWireframe: "Wireframe Contour (━)",
+			}
+			m.statusMsg = fmt.Sprintf("3D Mesh Fill Style: %s", names[m.fillStyle])
 
 		case key.Matches(msg, m.keys.Add):
 			m.addingHost = true
@@ -816,8 +938,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.targets[i].AvgRtt = 0
 				m.targets[i].Status = "PENDING"
 				chartW := m.width - 44
-				if chartW < 30 {
-					chartW = 30
+				if chartW < 20 {
+					chartW = 20
 				}
 				m.targets[i].Chart = streamlinechart.New(chartW, 10)
 				m.targets[i].Sparkline = sparkline.New(16, 1)
@@ -830,6 +952,188 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+type Cell3D struct {
+	Ch    rune
+	Style lipgloss.Style
+}
+
+func (m model) render3DStackView() string {
+	th := themes[m.themeIdx]
+	canvasW := m.width - 4
+	if canvasW < 40 {
+		canvasW = 40
+	}
+	canvasH := m.height - 10
+	if canvasH < 12 {
+		canvasH = 12
+	}
+
+	grid := make([][]Cell3D, canvasH)
+	for y := 0; y < canvasH; y++ {
+		grid[y] = make([]Cell3D, canvasW)
+		for x := 0; x < canvasW; x++ {
+			grid[y][x] = Cell3D{Ch: ' ', Style: lipgloss.NewStyle()}
+		}
+	}
+
+	var fillRune rune
+	switch m.fillStyle {
+	case FillSolid:
+		fillRune = '█'
+	case FillMedium:
+		fillRune = '▓'
+	case FillLight:
+		fillRune = '▒'
+	case FillWireframe:
+		fillRune = ' '
+	}
+
+	// PAINTER'S ALGORITHM: Render targets from Backmost (index len-1) down to Frontmost (index 0)
+	for i := len(m.targets) - 1; i >= 0; i-- {
+		target := m.targets[i]
+		z := i
+
+		offsetX := (len(m.targets) - 1 - z) * m.depthX
+		offsetY := (len(m.targets) - 1 - z) * m.depthY
+		baseY := canvasH - 3 - offsetY
+
+		if baseY < 2 || baseY >= canvasH {
+			continue
+		}
+
+		targetColor := target.ColorHex
+		if target.Status == "DOWN" {
+			targetColor = "#9d0006"
+		}
+
+		bodyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(targetColor))
+		topStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(targetColor)).Bold(true)
+		dimStyle := lipgloss.NewStyle().Foreground(th.CardBorder)
+
+		sampleCount := len(target.Samples)
+		maxSamplesWidth := canvasW - offsetX - 18
+		if maxSamplesWidth > 120 {
+			maxSamplesWidth = 120
+		}
+		if maxSamplesWidth < 10 {
+			maxSamplesWidth = 10
+		}
+
+		startSampleIdx := 0
+		if sampleCount > maxSamplesWidth {
+			startSampleIdx = sampleCount - maxSamplesWidth
+		}
+
+		visibleLen := sampleCount - startSampleIdx
+		if visibleLen <= 0 {
+			for x := 0; x < 20; x++ {
+				px := offsetX + 14 + x
+				if px >= 0 && px < canvasW && baseY >= 0 && baseY < canvasH {
+					grid[baseY][px] = Cell3D{Ch: '┄', Style: dimStyle}
+				}
+			}
+		} else {
+			for step := 0; step < visibleLen; step++ {
+				s := target.Samples[startSampleIdx+step]
+				px := offsetX + 14 + step
+				if px < 0 || px >= canvasW {
+					continue
+				}
+
+				var h int
+				if s.Rtt < 0 {
+					h = 0
+				} else {
+					ms := float64(s.Rtt.Milliseconds())
+					h = int(math.Round(ms * m.scaleY))
+					if h < 1 {
+						h = 1
+					}
+				}
+
+				if h > baseY-2 {
+					h = baseY - 2
+				}
+				topY := baseY - h
+
+				// Solid Occlusion Fill
+				for py := topY; py <= baseY; py++ {
+					if py < 0 || py >= canvasH {
+						continue
+					}
+
+					var r rune
+					var st lipgloss.Style
+
+					if s.Rtt < 0 {
+						r = '✕'
+						st = lipgloss.NewStyle().Foreground(th.SparklineRed).Bold(true)
+					} else if py == topY {
+						r = '▀'
+						st = topStyle
+					} else if py == baseY {
+						r = '▄'
+						st = dimStyle
+					} else {
+						r = fillRune
+						st = bodyStyle
+					}
+
+					grid[py][px] = Cell3D{Ch: r, Style: st}
+				}
+			}
+		}
+
+		// Host Name Tag attached to 3D Baseline
+		tagText := fmt.Sprintf(" ▶ %-10s ", fmt.Sprintf("%s:%d", target.Host, target.Port))
+		tagStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color(targetColor)).
+			Foreground(th.HostText).
+			Bold(true)
+
+		tagRunes := []rune(tagText)
+		for tIdx, r := range tagRunes {
+			px := offsetX + tIdx
+			if px >= 0 && px < canvasW && baseY >= 0 && baseY < canvasH {
+				grid[baseY][px] = Cell3D{Ch: r, Style: tagStyle}
+			}
+		}
+	}
+
+	var sb strings.Builder
+	for y := 0; y < canvasH; y++ {
+		for x := 0; x < canvasW; x++ {
+			cell := grid[y][x]
+			if cell.Ch == ' ' {
+				sb.WriteRune(' ')
+			} else {
+				sb.WriteString(cell.Style.Render(string(cell.Ch)))
+			}
+		}
+		if y < canvasH-1 {
+			sb.WriteRune('\n')
+		}
+	}
+
+	panelTitle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(th.DetailTitle).
+		Render("🏔  3D Z-AXIS STACKED LATENCY WATERFALL")
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		panelTitle,
+		sb.String(),
+	)
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(th.DetailBorder).
+		Padding(0, 1).
+		Width(m.width - 2).
+		Height(m.height - 8).
+		Render(content)
 }
 
 func (m model) renderTable() string {
@@ -956,6 +1260,10 @@ func (m model) renderChartPanel(t Target) string {
 }
 
 func (m model) View() string {
+	if m.width == 0 {
+		return "Initializing 3D Ping Dashboard..."
+	}
+
 	th := themes[m.themeIdx]
 	var doc strings.Builder
 
@@ -971,9 +1279,11 @@ func (m model) View() string {
 		pauseState = " [PAUSED]"
 	}
 
-	viewName := "Split View"
-	if m.viewMode == ViewExpandedChart {
-		viewName = "Expanded Chart"
+	viewName := "3D Waterfall Stack"
+	if m.viewMode == ViewSplit {
+		viewName = "Split View"
+	} else if m.viewMode == ViewExpandedChart {
+		viewName = "2D ntcharts View"
 	}
 
 	header := titleStyle.Render("📡 VISUAL PING DASHBOARD") + subTitleStyle.Render(fmt.Sprintf("  %s%d targets | %s | Theme: %s%s", spinStr, len(m.targets), viewName, th.Name, pauseState))
@@ -984,14 +1294,18 @@ func (m model) View() string {
 		selectedTarget = m.targets[m.cursor]
 	}
 
-	if m.viewMode == ViewExpandedChart {
+	switch m.viewMode {
+	case View3DStack:
+		doc.WriteString(m.render3DStackView() + "\n")
+
+	case ViewExpandedChart:
 		if len(m.targets) > 0 {
 			doc.WriteString(m.renderChartPanel(selectedTarget) + "\n")
 		} else {
 			doc.WriteString(lipgloss.NewStyle().Foreground(th.LastError).Render("No targets configured. Press 'a' to add a host.") + "\n")
 		}
-	} else {
-		// Split View
+
+	case ViewSplit:
 		doc.WriteString(m.renderTable() + "\n")
 		if len(m.targets) > 0 {
 			doc.WriteString(m.renderChartPanel(selectedTarget) + "\n")
@@ -1056,7 +1370,7 @@ func loadConfigFile(path string) (*ConfigFile, error) {
 }
 
 func printUsage() {
-	fmt.Printf("tboard v%s - Interactive visual ping dashboard TUI (ntcharts enabled)\n\n", version)
+	fmt.Printf("tboard v%s - Interactive 3D visual ping dashboard TUI\n\n", version)
 	fmt.Println("Usage:")
 	fmt.Println("  tboard [flags] [host[:port] ...]")
 	fmt.Println("\nExamples:")
@@ -1132,12 +1446,12 @@ func main() {
 			if cfg.Theme != "" && themeName == "gruvbox-light" {
 				selectedThemeIdx = parseThemeName(cfg.Theme)
 			}
-			for _, ct := range cfg.Targets {
+			for i, ct := range cfg.Targets {
 				p := ct.Port
 				if p <= 0 {
 					p = defaultPort
 				}
-				targets = append(targets, newTarget(ct.Host, p, 50, 10))
+				targets = append(targets, newTarget(ct.Host, p, 50, 10, i))
 			}
 		} else if configFile != "" && flag.Lookup("c").Value.String() != "" {
 			fmt.Fprintf(os.Stderr, "Error loading config file %s: %v\n", configFile, err)
@@ -1148,9 +1462,9 @@ func main() {
 	posArgs := flag.Args()
 	if len(posArgs) > 0 {
 		cliTargets := make([]Target, 0, len(posArgs))
-		for _, arg := range posArgs {
+		for i, arg := range posArgs {
 			host, port := parseHostPort(arg, defaultPort)
-			cliTargets = append(cliTargets, newTarget(host, port, 50, 10))
+			cliTargets = append(cliTargets, newTarget(host, port, 50, 10, i))
 		}
 		targets = cliTargets
 	}

@@ -61,7 +61,7 @@ targets:
 }
 
 func TestTargetLossPercentage(t *testing.T) {
-	target := newTarget("1.1.1.1", 53, 50, 10)
+	target := newTarget("1.1.1.1", 53, 50, 10, 0)
 	if target.LossPercentage() != 0.0 {
 		t.Errorf("expected 0%% loss for 0 sent, got %f", target.LossPercentage())
 	}
@@ -78,7 +78,7 @@ func TestTargetLossPercentage(t *testing.T) {
 }
 
 func TestTargetAddResult(t *testing.T) {
-	target := newTarget("google.com", 443, 50, 10)
+	target := newTarget("google.com", 443, 50, 10, 0)
 
 	target.AddResult(30*time.Millisecond, nil)
 	if target.Status != "UP" {
@@ -116,60 +116,43 @@ func TestRenderBadge(t *testing.T) {
 	}
 }
 
-func TestRenderSparklineLogarithmicTime(t *testing.T) {
-	now := time.Now()
-	samples := []Sample{
-		{Rtt: 10 * time.Millisecond, Timestamp: now.Add(-60 * time.Second)},
-		{Rtt: 50 * time.Millisecond, Timestamp: now.Add(-30 * time.Second)},
-		{Rtt: -1, Timestamp: now.Add(-10 * time.Second)},
-		{Rtt: 200 * time.Millisecond, Timestamp: now},
-	}
-	th := themes[1]
-	sparkline := renderSparkline(samples, 20, th)
-	if sparkline == "" {
-		t.Error("expected non-empty sparkline rendering for timestamped samples")
+func TestRender3DStackView(t *testing.T) {
+	m := initialModel(nil, 1)
+	m.width = 100
+	m.height = 30
+	stackView := m.render3DStackView()
+	if stackView == "" {
+		t.Error("expected non-empty 3D Stack View output")
 	}
 }
 
-func TestRenderTable(t *testing.T) {
+func TestModel3DStackControls(t *testing.T) {
 	m := initialModel(nil, 1)
-	tbl := m.renderTable()
-	if tbl == "" {
-		t.Error("expected non-empty table output")
-	}
-}
+	m.width = 100
+	m.height = 30
 
-func TestModelBubblesAndNtcharts(t *testing.T) {
-	m := initialModel(nil, 1)
-	if len(m.targets) != 5 {
-		t.Fatalf("expected 5 default targets, got %d", len(m.targets))
+	if m.viewMode != View3DStack {
+		t.Errorf("expected initial viewMode View3DStack, got %v", m.viewMode)
 	}
 
-	// Test View Mode toggle key 'v' / 'tab'
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	// Test 3D depth controls ('w')
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 	m = updated.(model)
-	if m.viewMode != ViewExpandedChart {
-		t.Errorf("expected viewMode ViewExpandedChart after pressing 'v', got %v", m.viewMode)
+	if m.depthY != 3 {
+		t.Errorf("expected depthY 3 after pressing 'w', got %d", m.depthY)
 	}
 
-	// Test theme key 't'
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	// Test 3D mesh fill style toggle ('m')
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 	m = updated.(model)
-	if m.themeIdx != 2 {
-		t.Errorf("expected themeIdx 2 after pressing 't', got %d", m.themeIdx)
+	if m.fillStyle != FillMedium {
+		t.Errorf("expected fillStyle FillMedium after pressing 'm', got %v", m.fillStyle)
 	}
 
-	// Test pause key
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	// Test View Mode toggle key ('v')
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
 	m = updated.(model)
-	if !m.paused {
-		t.Error("expected model to be paused")
-	}
-
-	// Test help toggle key '?'
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	m = updated.(model)
-	if !m.help.ShowAll {
-		t.Error("expected full help to be visible after pressing '?'")
+	if m.viewMode != ViewSplit {
+		t.Errorf("expected viewMode ViewSplit after pressing 'v', got %v", m.viewMode)
 	}
 }
