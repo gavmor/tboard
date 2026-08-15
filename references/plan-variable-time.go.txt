@@ -1,0 +1,241 @@
+// ... existing code ...
+	"github.com/charmbracelet/lipgloss"
+)
+
+// Sample records a latency measurement and its exact timestamp.
+type Sample struct {
+	Rtt       time.Duration // -1 indicates timeout/error
+	Timestamp time.Time
+}
+
+// Target represents a host monitored by the ping dashboard.
+type Target struct {
+	Host      string
+	Port      int
+	Samples   []Sample // Time-stamped history for variable time-axis rendering
+	Sent      int
+	Received  int
+	LastRtt   time.Duration
+	MinRtt    time.Duration
+	MaxRtt    time.Duration
+	AvgRtt    time.Duration
+	Status    string // "UP", "SLOW", "DOWN", "PENDING"
+	LastError string
+}
+
+func newTarget(host string, port int) Target {
+	return Target{
+		Host:    host,
+		Port:    port,
+		Samples: make([]Sample, 0, 180),
+		Status:  "PENDING",
+	}
+}
+
+func (t Target) LossPercentage() float64 {
+	if t.Sent == 0 {
+		return 0.0
+	}
+	lost := t.Sent - t.Received
+	return (float64(lost) / float64(t.Sent)) * 100.0
+}
+
+func (t *Target) AddResult(rtt time.Duration, err error) {
+	t.Sent++
+	const maxHistory = 180 // Up to 3 minutes of history
+
+	sample := Sample{
+		Timestamp: time.Now(),
+	}
+
+	if err != nil {
+		t.LastError = err.Error()
+		sample.Rtt = -1
+		t.Status = "DOWN"
+	} else {
+		t.Received++
+		t.LastRtt = rtt
+		sample.Rtt = rtt
+		t.LastError = ""
+
+		if t.MinRtt == 0 || rtt < t.MinRtt {
+			t.MinRtt = rtt
+		}
+		if rtt > t.MaxRtt {
+			t.MaxRtt = rtt
+		}
+
+		var total time.Duration
+		validCount := 0
+		for _, s := range t.Samples {
+			if s.Rtt >= 0 {
+				total += s.Rtt
+				validCount++
+			}
+		}
+		if validCount > 0 {
+			t.AvgRtt = total / time.Duration(validCount)
+		}
+
+		if rtt > 200*time.Millisecond {
+			t.Status = "SLOW"
+		} else {
+			t.Status = "UP"
+		}
+	}
+
+	t.Samples = append(t.Samples, sample)
+	if len(t.Samples) > maxHistory {
+		t.Samples = t.Samples[1:]
+	}
+}
+
+// Keymap definition using bubbles/key
+// ... existing code ...
+
+func (m *model) updateTableRows() {
+	rows := make([]table.Row, len(m.targets))
+	for i, t := range m.targets {
+		rttStr := "---"
+		if t.LastRtt > 0 && t.Status != "DOWN" {
+			rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())
+		}
+
+		avgStr := "---"
+		if t.AvgRtt > 0 {
+			avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+		}
+
+		sparkline := renderSparkline(t.Samples, 22)
+		lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
+		hostInfo := fmt.Sprintf("%s:%d", t.Host, t.Port)
+
+		rows[i] = table.Row{
+			t.Status,
+			hostInfo,
+			sparkline,
+			rttStr,
+			avgStr,
+			lossStr,
+		}
+	}
+	m.table.SetRows(rows)
+}
+
+// ... existing code ...
+		case key.Matches(msg, keys.Reset):
+			for i := range m.targets {
+				m.targets[i].Sent = 0
+				m.targets[i].Received = 0
+				m.targets[i].Samples = nil
+				m.targets[i].MinRtt = 0
+				m.targets[i].MaxRtt = 0
+				m.targets[i].AvgRtt = 0
+				m.targets[i].Status = "PENDING"
+			}
+			m.updateTableRows()
+			m.statusMsg = "Stats reset"
+
+		case key.Matches(msg, keys.Help):
+// ... existing code ...
+
+// renderSparkline applies logarithmic variable time-axis compression (C = 15.0).
+// Recent data (right) is spread out for high detail, while older data (left) is exponentially compressed.
+func renderSparkline(samples []Sample, width int) string {
+	if len(samples) == 0 {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render(strings.Repeat("░", width))
+	}
+
+	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	const compression = 15.0 // Logarithmic compression factor C
+
+	now := time.Now()
+	oldestTime := samples[0].Timestamp
+	maxAge := now.Sub(oldestTime)
+	if maxAge < time.Second {
+		maxAge = time.Second
+	}
+
+	type bucket struct {
+		maxRtt   time.Duration
+		hasError bool
+		count    int
+	}
+	buckets := make([]bucket, width)
+
+	denom := math.Log(1.0 + compression)
+
+	// Map each timestamped sample into log-compressed x-coordinates
+	for _, s := range samples {
+		age := now.Sub(s.Timestamp)
+		if age < 0 {
+			age = 0
+		}
+		ageRatio := float64(age) / float64(maxAge)
+		if ageRatio > 1.0 {
+			ageRatio = 1.0
+		}
+
+		// Logarithmic distance from right edge (0.0 = right/now, 1.0 = left/oldest)
+		normDist := math.Log(1.0+compression*ageRatio) / denom
+		col := int(math.Round(float64(width-1) * (1.0 - normDist)))
+
+		if col < 0 {
+			col = 0
+		}
+		if col >= width {
+			col = width - 1
+		}
+
+		b := &buckets[col]
+		b.count++
+		if s.Rtt < 0 {
+			b.hasError = true
+		} else if s.Rtt > b.maxRtt {
+			b.maxRtt = s.Rtt // Peak-hold aggregation preserves spikes in compressed columns
+		}
+	}
+
+	// Forward-fill empty gaps between sparse buckets
+	lastValid := bucket{maxRtt: 0, hasError: false, count: 0}
+	for i := 0; i < width; i++ {
+		if buckets[i].count > 0 {
+			lastValid = buckets[i]
+		} else if lastValid.count > 0 {
+			buckets[i] = lastValid
+		}
+	}
+
+	var sb strings.Builder
+	for i := 0; i < width; i++ {
+		b := buckets[i]
+		if b.count == 0 {
+			sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render("░"))
+			continue
+		}
+
+		if b.hasError {
+			sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("✕"))
+			continue
+		}
+
+		ms := float64(b.maxRtt.Microseconds()) / 1000.0
+		idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
+
+		var color string
+		if ms < 40 {
+			color = "#50FA7B"
+		} else if ms < 120 {
+			color = "#F1FA8C"
+		} else {
+			color = "#FF5555"
+		}
+
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(string(blocks[idx])))
+	}
+
+	return sb.String()
+}
+
+func (m model) View() string {
+// ... existing code ...

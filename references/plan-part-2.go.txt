@@ -1,0 +1,733 @@
+package mainimport ("fmt""math""net""os""strconv""strings""time""github.com/charmbracelet/bubbles/help"
+"github.com/charmbracelet/bubbles/key"
+"github.com/charmbracelet/bubbles/progress"
+"github.com/charmbracelet/bubbles/spinner"
+"github.com/charmbracelet/bubbles/table"
+"github.com/charmbracelet/bubbles/textinput"
+tea "github.com/charmbracelet/bubbletea"
+"github.com/charmbracelet/lipgloss"
+)// Target represents a host monitored by the ping dashboard.type Target struct {Host      stringPort      intRtts      []time.Duration // History of RTTs (-1 indicates timeout/error)Sent      intReceived  intLastRtt   time.DurationMinRtt    time.DurationMaxRtt    time.DurationAvgRtt    time.DurationStatus    string // "UP", "SLOW", "DOWN", "PENDING"LastError string}func newTarget(host string, port int) Target {return Target{Host:   host,Port:   port,Rtts:   make([]time.Duration, 0, 30),Status: "PENDING",}}func (t Target) LossPercentage() float64 {if t.Sent == 0 {return 0.0}lost := t.Sent - t.Receivedreturn (float64(lost) / float64(t.Sent)) * 100.0}func (t *Target) AddResult(rtt time.Duration, err error) {t.Sent++const maxHistory = 30if err != nil {
+	t.LastError = err.Error()
+	t.Rtts = append(t.Rtts, -1)
+	t.Status = "DOWN"
+} else {
+	t.Received++
+	t.LastRtt = rtt
+	t.Rtts = append(t.Rtts, rtt)
+	t.LastError = ""
+
+	if t.MinRtt == 0 || rtt < t.MinRtt {
+		t.MinRtt = rtt
+	}
+	if rtt > t.MaxRtt {
+		t.MaxRtt = rtt
+	}
+
+	var total time.Duration
+	validCount := 0
+	for _, r := range t.Rtts {
+		if r >= 0 {
+			total += r
+			validCount++
+		}
+	}
+	if validCount > 0 {
+		t.AvgRtt = total / time.Duration(validCount)
+	}
+
+	if rtt > 200*time.Millisecond {
+		t.Status = "SLOW"
+	} else {
+		t.Status = "UP"
+	}
+}
+
+if len(t.Rtts) > maxHistory {
+	t.Rtts = t.Rtts[1:]
+}
+}// Keymap definition using bubbles/keytype keyMap struct {Up     key.BindingDown   key.BindingAdd    key.BindingDelete key.BindingPause  key.BindingReset  key.BindingHelp   key.BindingQuit   key.Binding}func (k keyMap) ShortHelp() []key.Binding {return []key.Binding{k.Up, k.Down, k.Add, k.Delete, k.Pause, k.Help, k.Quit}}func (k keyMap) FullHelp() [][]key.Binding {return [][]key.Binding{{k.Up, k.Down, k.Add, k.Delete},{k.Pause, k.Reset, k.Help, k.Quit},}}var keys = keyMap{Up: key.NewBinding(key.WithKeys("up", "k"),key.WithHelp("↑/k", "up"),),Down: key.NewBinding(key.WithKeys("down", "j"),key.WithHelp("↓/j", "down"),),Add: key.NewBinding(key.WithKeys("a"),key.WithHelp("a", "add host"),),Delete: key.NewBinding(key.WithKeys("d"),key.WithHelp("d", "delete host"),),Pause: key.NewBinding(key.WithKeys(" "),key.WithHelp("space", "pause/resume"),),Reset: key.NewBinding(key.WithKeys("r"),key.WithHelp("r", "reset stats"),),Help: key.NewBinding(key.WithKeys("?"),key.WithHelp("?", "toggle help"),),Quit: key.NewBinding(key.WithKeys("q", "ctrl+c"),key.WithHelp("q", "quit"),),}// Messagestype tickMsg time.Timetype pingResultMsg struct {index intrtt   time.Durationerr   error}// Commandsfunc tickCmd() tea.Cmd {return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {return tickMsg(t)})}func pingHostCmd(index int, host string, port int) tea.Cmd {return func() tea.Msg {address := net.JoinHostPort(host, strconv.Itoa(port))start := time.Now()conn, err := net.DialTimeout("tcp", address, 1500*time.Millisecond)rtt := time.Since(start)	if err != nil {
+		return pingResultMsg{index: index, rtt: 0, err: err}
+	}
+	conn.Close()
+	return pingResultMsg{index: index, rtt: rtt, err: nil}
+}
+}// Main Model embedding Bubbles componentstype model struct {targets      []Targettable        table.Modelspinner      spinner.ModellossProgress progress.Modelhelp         help.ModelinputField   textinput.Modelwidth        intheight       intpaused       booladdingHost   boolstatusMsg    string}func initialModel() model {// 1. Textinput Componentti := textinput.New()ti.Placeholder = "example.com:80"ti.CharLimit = 64ti.Width = 30// 2. Spinner Component
+sp := spinner.New()
+sp.Spinner = spinner.Dot
+sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#BD93F9"))
+
+// 3. Help Component
+hlp := help.New()
+
+// 4. Progress Component
+pg := progress.New(
+	progress.WithScaledGradient("#50FA7B", "#FF5555"),
+	progress.WithWidth(25),
+)
+
+defaultTargets := []Target{
+	newTarget("1.1.1.1", 53),
+	newTarget("8.8.8.8", 53),
+	newTarget("google.com", 443),
+	newTarget("github.com", 443),
+	newTarget("127.0.0.1", 80),
+}
+
+// 5. Table Component
+columns := []table.Column{
+	{Title: "STATUS", Width: 8},
+	{Title: "TARGET", Width: 20},
+	{Title: "LATENCY SPARKLINE", Width: 24},
+	{Title: "LAST RTT", Width: 10},
+	{Title: "AVG RTT", Width: 10},
+	{Title: "LOSS", Width: 8},
+}
+
+tbl := table.New(
+	table.WithColumns(columns),
+	table.WithFocused(true),
+	table.WithHeight(7),
+)
+
+tStyle := table.DefaultStyles()
+tStyle.Header = tStyle.Header.
+	BorderStyle(lipgloss.NormalBorder()).
+	BorderForeground(lipgloss.Color("#6272A4")).
+	BorderBottom(true).
+	Bold(true)
+tStyle.Selected = tStyle.Selected.
+	Foreground(lipgloss.Color("#F8F8F2")).
+	Background(lipgloss.Color("#44475A")).
+	Bold(true)
+tbl.SetStyles(tStyle)
+
+m := model{
+	targets:      defaultTargets,
+	table:        tbl,
+	spinner:      sp,
+	help:         hlp,
+	lossProgress: pg,
+	inputField:   ti,
+	paused:       false,
+}
+
+m.updateTableRows()
+return m
+}func (m *model) updateTableRows() {rows := make([]table.Row, len(m.targets))for i, t := range m.targets {rttStr := "---"if t.LastRtt > 0 && t.Status != "DOWN" {rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())}	avgStr := "---"
+	if t.AvgRtt > 0 {
+		avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+	}
+
+	sparkline := renderSparkline(t.Rtts, 22)
+	lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
+	hostInfo := fmt.Sprintf("%s:%d", t.Host, t.Port)
+
+	rows[i] = table.Row{
+		t.Status,
+		hostInfo,
+		sparkline,
+		rttStr,
+		avgStr,
+		lossStr,
+	}
+}
+m.table.SetRows(rows)
+}func (m model) Init() tea.Cmd {var cmds []tea.Cmdcmds = append(cmds, tickCmd(), m.spinner.Tick)for i, t := range m.targets {
+	cmds = append(cmds, pingHostCmd(i, t.Host, t.Port))
+}
+
+return tea.Batch(cmds...)
+}func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {var cmds []tea.Cmdswitch msg := msg.(type) {
+case tea.WindowSizeMsg:
+	m.width = msg.Width
+	m.height = msg.Height
+	m.help.Width = msg.Width
+
+case spinner.TickMsg:
+	var cmd tea.Cmd
+	m.spinner, cmd = m.spinner.Update(msg)
+	cmds = append(cmds, cmd)
+
+case tickMsg:
+	if !m.paused {
+		for i, t := range m.targets {
+			cmds = append(cmds, pingHostCmd(i, t.Host, t.Port))
+		}
+	}
+	cmds = append(cmds, tickCmd())
+
+case pingResultMsg:
+	if msg.index >= 0 && msg.index < len(m.targets) {
+		m.targets[msg.index].AddResult(msg.rtt, msg.err)
+		m.updateTableRows()
+	}
+
+case tea.KeyMsg:
+	if m.addingHost {
+		switch msg.String() {
+		case "enter":
+			val := strings.TrimSpace(m.inputField.Value())
+			if val != "" {
+				host := val
+				port := 80
+				if strings.Contains(val, ":") {
+					parts := strings.Split(val, ":")
+					host = parts[0]
+					if p, err := strconv.Atoi(parts[1]); err == nil {
+						port = p
+					}
+				}
+				m.targets = append(m.targets, newTarget(host, port))
+				newIdx := len(m.targets) - 1
+				m.updateTableRows()
+				cmds = append(cmds, pingHostCmd(newIdx, host, port))
+				m.statusMsg = fmt.Sprintf("Added target %s:%d", host, port)
+			}
+			m.inputField.Reset()
+			m.addingHost = false
+			m.inputField.Blur()
+
+		case "esc":
+			m.inputField.Reset()
+			m.addingHost = false
+			m.inputField.Blur()
+
+		default:
+			var cmd tea.Cmd
+			m.inputField, cmd = m.inputField.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	switch {
+	case key.Matches(msg, keys.Quit):
+		return m, tea.Quit
+
+	case key.Matches(msg, keys.Add):
+		m.addingHost = true
+		m.inputField.Focus()
+		return m, textinput.Blink
+
+	case key.Matches(msg, keys.Delete):
+		if len(m.targets) > 0 {
+			cursor := m.table.Cursor()
+			if cursor >= 0 && cursor < len(m.targets) {
+				removed := m.targets[cursor].Host
+				m.targets = append(m.targets[:cursor], m.targets[cursor+1:]...)
+				m.updateTableRows()
+				m.statusMsg = fmt.Sprintf("Removed target %s", removed)
+			}
+		}
+
+	case key.Matches(msg, keys.Pause):
+		m.paused = !m.paused
+		if m.paused {
+			m.statusMsg = "Pings paused"
+		} else {
+			m.statusMsg = "Resumed pings"
+		}
+
+	case key.Matches(msg, keys.Reset):
+		for i := range m.targets {
+			m.targets[i].Sent = 0
+			m.targets[i].Received = 0
+			m.targets[i].Rtts = nil
+			m.targets[i].MinRtt = 0
+			m.targets[i].MaxRtt = 0
+			m.targets[i].AvgRtt = 0
+			m.targets[i].Status = "PENDING"
+		}
+		m.updateTableRows()
+		m.statusMsg = "Stats reset"
+
+	case key.Matches(msg, keys.Help):
+		m.help.ShowAll = !m.help.ShowAll
+
+	default:
+		// Pass key messages to the table component for built-in navigation
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+}
+
+return m, tea.Batch(cmds...)
+}// Styling definitionsvar (titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FAFAFA")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1)subTitleStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#8A8A8A")).
+		Italic(true)
+
+statLabel = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#6272A4"))
+
+statVal = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Color("#F8F8F2"))
+)func renderSparkline(rtts []time.Duration, width int) string {if len(rtts) == 0 {return lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render(strings.Repeat("░", width))}blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+var sb strings.Builder
+
+slice := rtts
+if len(slice) > width {
+	slice = slice[len(slice)-width:]
+}
+
+for i := 0; i < width-len(slice); i++ {
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render("░"))
+}
+
+for _, rtt := range slice {
+	if rtt < 0 {
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("✕"))
+		continue
+	}
+
+	ms := float64(rtt.Microseconds()) / 1000.0
+	idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
+
+	var color string
+	if ms < 40 {
+		color = "#50FA7B"
+	} else if ms < 120 {
+		color = "#F1FA8C"
+	} else {
+		color = "#FF5555"
+	}
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(string(blocks[idx])))
+}
+
+return sb.String()
+}func (m model) View() string {var doc strings.Builder// Header with live Bubbles Spinner
+pauseState := ""
+if m.paused {
+	pauseState = " [PAUSED]"
+} else {
+	pauseState = " " + m.spinner.View()
+}
+
+header := titleStyle.Render("📡 VISUAL PING DASHBOARD") +
+	subTitleStyle.Render(fmt.Sprintf("  %d targets monitored%s", len(m.targets), pauseState))
+doc.WriteString(header + "\n\n")
+
+// Render Bubbles Table Component
+doc.WriteString(m.table.View() + "\n")
+
+// Target Details Panel with Bubbles Progress Bar
+cursor := m.table.Cursor()
+if len(m.targets) > 0 && cursor >= 0 && cursor < len(m.targets) {
+	selected := m.targets[cursor]
+	doc.WriteString("\n")
+
+	detailTitle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#BD93F9")).
+		Render(fmt.Sprintf("Target Details: %s:%d", selected.Host, selected.Port))
+
+	lossRatio := selected.LossPercentage() / 100.0
+	progressBar := m.lossProgress.ViewAs(lossRatio)
+
+	stats := fmt.Sprintf("%s %s   %s %s   %s %s   %s %d/%d\n%s Loss: %s",
+		statLabel.Render("Min:"), statVal.Render(fmt.Sprintf("%dms", selected.MinRtt.Milliseconds())),
+		statLabel.Render("Max:"), statVal.Render(fmt.Sprintf("%dms", selected.MaxRtt.Milliseconds())),
+		statLabel.Render("Avg:"), statVal.Render(fmt.Sprintf("%dms", selected.AvgRtt.Milliseconds())),
+		statLabel.Render("Sent/Recv:"), selected.Sent, selected.Received,
+		statLabel.Render("Packet Loss:"), progressBar,
+	)
+
+	if selected.LastError != "" {
+		stats += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("Last Error: "+selected.LastError)
+	}
+
+	boxWidth := m.width - 4
+	if boxWidth < 50 {
+		boxWidth = 60
+	}
+
+	detailBox := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#6272A4")).
+		Padding(0, 1).
+		Width(boxWidth).
+		Render(detailTitle + "\n" + stats)
+
+	doc.WriteString(detailBox + "\n")
+}
+
+// Modal / Input Status Line
+if m.addingHost {
+	doc.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#50FA7B")).Render("Enter host to ping (host:port): ") + m.inputField.View() + "\n")
+} else if m.statusMsg != "" {
+	doc.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Italic(true).Render("Status: "+m.statusMsg) + "\n")
+} else {
+	doc.WriteString("\n")
+}
+
+// Render Bubbles Help Component
+doc.WriteString(m.help.View(keys) + "\n")
+
+return doc.String()
+}func main() {p := tea.NewProgram(initialModel(), tea.WithAltScreen())if _, err := p.Run(); err != nil {fmt.Printf("Error running ping dashboard: %v\n", err)os.Exit(1)}}package mainimport ("fmt""math""net""os""strconv""strings""time""github.com/charmbracelet/bubbles/help"
+"github.com/charmbracelet/bubbles/key"
+"github.com/charmbracelet/bubbles/progress"
+"github.com/charmbracelet/bubbles/spinner"
+"github.com/charmbracelet/bubbles/table"
+"github.com/charmbracelet/bubbles/textinput"
+tea "github.com/charmbracelet/bubbletea"
+"github.com/charmbracelet/lipgloss"
+)// Target represents a host monitored by the ping dashboard.type Target struct {Host      stringPort      intRtts      []time.Duration // History of RTTs (-1 indicates timeout/error)Sent      intReceived  intLastRtt   time.DurationMinRtt    time.DurationMaxRtt    time.DurationAvgRtt    time.DurationStatus    string // "UP", "SLOW", "DOWN", "PENDING"LastError string}func newTarget(host string, port int) Target {return Target{Host:   host,Port:   port,Rtts:   make([]time.Duration, 0, 30),Status: "PENDING",}}func (t Target) LossPercentage() float64 {if t.Sent == 0 {return 0.0}lost := t.Sent - t.Receivedreturn (float64(lost) / float64(t.Sent)) * 100.0}func (t *Target) AddResult(rtt time.Duration, err error) {t.Sent++const maxHistory = 30if err != nil {
+	t.LastError = err.Error()
+	t.Rtts = append(t.Rtts, -1)
+	t.Status = "DOWN"
+} else {
+	t.Received++
+	t.LastRtt = rtt
+	t.Rtts = append(t.Rtts, rtt)
+	t.LastError = ""
+
+	if t.MinRtt == 0 || rtt < t.MinRtt {
+		t.MinRtt = rtt
+	}
+	if rtt > t.MaxRtt {
+		t.MaxRtt = rtt
+	}
+
+	var total time.Duration
+	validCount := 0
+	for _, r := range t.Rtts {
+		if r >= 0 {
+			total += r
+			validCount++
+		}
+	}
+	if validCount > 0 {
+		t.AvgRtt = total / time.Duration(validCount)
+	}
+
+	if rtt > 200*time.Millisecond {
+		t.Status = "SLOW"
+	} else {
+		t.Status = "UP"
+	}
+}
+
+if len(t.Rtts) > maxHistory {
+	t.Rtts = t.Rtts[1:]
+}
+}// Keymap definition using bubbles/keytype keyMap struct {Up     key.BindingDown   key.BindingAdd    key.BindingDelete key.BindingPause  key.BindingReset  key.BindingHelp   key.BindingQuit   key.Binding}func (k keyMap) ShortHelp() []key.Binding {return []key.Binding{k.Up, k.Down, k.Add, k.Delete, k.Pause, k.Help, k.Quit}}func (k keyMap) FullHelp() [][]key.Binding {return [][]key.Binding{{k.Up, k.Down, k.Add, k.Delete},{k.Pause, k.Reset, k.Help, k.Quit},}}var keys = keyMap{Up: key.NewBinding(key.WithKeys("up", "k"),key.WithHelp("↑/k", "up"),),Down: key.NewBinding(key.WithKeys("down", "j"),key.WithHelp("↓/j", "down"),),Add: key.NewBinding(key.WithKeys("a"),key.WithHelp("a", "add host"),),Delete: key.NewBinding(key.WithKeys("d"),key.WithHelp("d", "delete host"),),Pause: key.NewBinding(key.WithKeys(" "),key.WithHelp("space", "pause/resume"),),Reset: key.NewBinding(key.WithKeys("r"),key.WithHelp("r", "reset stats"),),Help: key.NewBinding(key.WithKeys("?"),key.WithHelp("?", "toggle help"),),Quit: key.NewBinding(key.WithKeys("q", "ctrl+c"),key.WithHelp("q", "quit"),),}// Messagestype tickMsg time.Timetype pingResultMsg struct {index intrtt   time.Durationerr   error}// Commandsfunc tickCmd() tea.Cmd {return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {return tickMsg(t)})}func pingHostCmd(index int, host string, port int) tea.Cmd {return func() tea.Msg {address := net.JoinHostPort(host, strconv.Itoa(port))start := time.Now()conn, err := net.DialTimeout("tcp", address, 1500*time.Millisecond)rtt := time.Since(start)	if err != nil {
+		return pingResultMsg{index: index, rtt: 0, err: err}
+	}
+	conn.Close()
+	return pingResultMsg{index: index, rtt: rtt, err: nil}
+}
+}// Main Model embedding Bubbles componentstype model struct {targets      []Targettable        table.Modelspinner      spinner.ModellossProgress progress.Modelhelp         help.ModelinputField   textinput.Modelwidth        intheight       intpaused       booladdingHost   boolstatusMsg    string}func initialModel() model {// 1. Textinput Componentti := textinput.New()ti.Placeholder = "example.com:80"ti.CharLimit = 64ti.Width = 30// 2. Spinner Component
+sp := spinner.New()
+sp.Spinner = spinner.Dot
+sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#BD93F9"))
+
+// 3. Help Component
+hlp := help.New()
+
+// 4. Progress Component
+pg := progress.New(
+	progress.WithScaledGradient("#50FA7B", "#FF5555"),
+	progress.WithWidth(25),
+)
+
+defaultTargets := []Target{
+	newTarget("1.1.1.1", 53),
+	newTarget("8.8.8.8", 53),
+	newTarget("google.com", 443),
+	newTarget("github.com", 443),
+	newTarget("127.0.0.1", 80),
+}
+
+// 5. Table Component
+columns := []table.Column{
+	{Title: "STATUS", Width: 8},
+	{Title: "TARGET", Width: 20},
+	{Title: "LATENCY SPARKLINE", Width: 24},
+	{Title: "LAST RTT", Width: 10},
+	{Title: "AVG RTT", Width: 10},
+	{Title: "LOSS", Width: 8},
+}
+
+tbl := table.New(
+	table.WithColumns(columns),
+	table.WithFocused(true),
+	table.WithHeight(7),
+)
+
+tStyle := table.DefaultStyles()
+tStyle.Header = tStyle.Header.
+	BorderStyle(lipgloss.NormalBorder()).
+	BorderForeground(lipgloss.Color("#6272A4")).
+	BorderBottom(true).
+	Bold(true)
+tStyle.Selected = tStyle.Selected.
+	Foreground(lipgloss.Color("#F8F8F2")).
+	Background(lipgloss.Color("#44475A")).
+	Bold(true)
+tbl.SetStyles(tStyle)
+
+m := model{
+	targets:      defaultTargets,
+	table:        tbl,
+	spinner:      sp,
+	help:         hlp,
+	lossProgress: pg,
+	inputField:   ti,
+	paused:       false,
+}
+
+m.updateTableRows()
+return m
+}func (m *model) updateTableRows() {rows := make([]table.Row, len(m.targets))for i, t := range m.targets {rttStr := "---"if t.LastRtt > 0 && t.Status != "DOWN" {rttStr = fmt.Sprintf("%d ms", t.LastRtt.Milliseconds())}	avgStr := "---"
+	if t.AvgRtt > 0 {
+		avgStr = fmt.Sprintf("%d ms", t.AvgRtt.Milliseconds())
+	}
+
+	sparkline := renderSparkline(t.Rtts, 22)
+	lossStr := fmt.Sprintf("%.1f%%", t.LossPercentage())
+	hostInfo := fmt.Sprintf("%s:%d", t.Host, t.Port)
+
+	rows[i] = table.Row{
+		t.Status,
+		hostInfo,
+		sparkline,
+		rttStr,
+		avgStr,
+		lossStr,
+	}
+}
+m.table.SetRows(rows)
+}func (m model) Init() tea.Cmd {var cmds []tea.Cmdcmds = append(cmds, tickCmd(), m.spinner.Tick)for i, t := range m.targets {
+	cmds = append(cmds, pingHostCmd(i, t.Host, t.Port))
+}
+
+return tea.Batch(cmds...)
+}func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {var cmds []tea.Cmdswitch msg := msg.(type) {
+case tea.WindowSizeMsg:
+	m.width = msg.Width
+	m.height = msg.Height
+	m.help.Width = msg.Width
+
+case spinner.TickMsg:
+	var cmd tea.Cmd
+	m.spinner, cmd = m.spinner.Update(msg)
+	cmds = append(cmds, cmd)
+
+case tickMsg:
+	if !m.paused {
+		for i, t := range m.targets {
+			cmds = append(cmds, pingHostCmd(i, t.Host, t.Port))
+		}
+	}
+	cmds = append(cmds, tickCmd())
+
+case pingResultMsg:
+	if msg.index >= 0 && msg.index < len(m.targets) {
+		m.targets[msg.index].AddResult(msg.rtt, msg.err)
+		m.updateTableRows()
+	}
+
+case tea.KeyMsg:
+	if m.addingHost {
+		switch msg.String() {
+		case "enter":
+			val := strings.TrimSpace(m.inputField.Value())
+			if val != "" {
+				host := val
+				port := 80
+				if strings.Contains(val, ":") {
+					parts := strings.Split(val, ":")
+					host = parts[0]
+					if p, err := strconv.Atoi(parts[1]); err == nil {
+						port = p
+					}
+				}
+				m.targets = append(m.targets, newTarget(host, port))
+				newIdx := len(m.targets) - 1
+				m.updateTableRows()
+				cmds = append(cmds, pingHostCmd(newIdx, host, port))
+				m.statusMsg = fmt.Sprintf("Added target %s:%d", host, port)
+			}
+			m.inputField.Reset()
+			m.addingHost = false
+			m.inputField.Blur()
+
+		case "esc":
+			m.inputField.Reset()
+			m.addingHost = false
+			m.inputField.Blur()
+
+		default:
+			var cmd tea.Cmd
+			m.inputField, cmd = m.inputField.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	switch {
+	case key.Matches(msg, keys.Quit):
+		return m, tea.Quit
+
+	case key.Matches(msg, keys.Add):
+		m.addingHost = true
+		m.inputField.Focus()
+		return m, textinput.Blink
+
+	case key.Matches(msg, keys.Delete):
+		if len(m.targets) > 0 {
+			cursor := m.table.Cursor()
+			if cursor >= 0 && cursor < len(m.targets) {
+				removed := m.targets[cursor].Host
+				m.targets = append(m.targets[:cursor], m.targets[cursor+1:]...)
+				m.updateTableRows()
+				m.statusMsg = fmt.Sprintf("Removed target %s", removed)
+			}
+		}
+
+	case key.Matches(msg, keys.Pause):
+		m.paused = !m.paused
+		if m.paused {
+			m.statusMsg = "Pings paused"
+		} else {
+			m.statusMsg = "Resumed pings"
+		}
+
+	case key.Matches(msg, keys.Reset):
+		for i := range m.targets {
+			m.targets[i].Sent = 0
+			m.targets[i].Received = 0
+			m.targets[i].Rtts = nil
+			m.targets[i].MinRtt = 0
+			m.targets[i].MaxRtt = 0
+			m.targets[i].AvgRtt = 0
+			m.targets[i].Status = "PENDING"
+		}
+		m.updateTableRows()
+		m.statusMsg = "Stats reset"
+
+	case key.Matches(msg, keys.Help):
+		m.help.ShowAll = !m.help.ShowAll
+
+	default:
+		// Pass key messages to the table component for built-in navigation
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+}
+
+return m, tea.Batch(cmds...)
+}// Styling definitionsvar (titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FAFAFA")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1)subTitleStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#8A8A8A")).
+		Italic(true)
+
+statLabel = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#6272A4"))
+
+statVal = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Color("#F8F8F2"))
+)func renderSparkline(rtts []time.Duration, width int) string {if len(rtts) == 0 {return lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render(strings.Repeat("░", width))}blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+var sb strings.Builder
+
+slice := rtts
+if len(slice) > width {
+	slice = slice[len(slice)-width:]
+}
+
+for i := 0; i < width-len(slice); i++ {
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#44475A")).Render("░"))
+}
+
+for _, rtt := range slice {
+	if rtt < 0 {
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("✕"))
+		continue
+	}
+
+	ms := float64(rtt.Microseconds()) / 1000.0
+	idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
+
+	var color string
+	if ms < 40 {
+		color = "#50FA7B"
+	} else if ms < 120 {
+		color = "#F1FA8C"
+	} else {
+		color = "#FF5555"
+	}
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(string(blocks[idx])))
+}
+
+return sb.String()
+}func (m model) View() string {var doc strings.Builder// Header with live Bubbles Spinner
+pauseState := ""
+if m.paused {
+	pauseState = " [PAUSED]"
+} else {
+	pauseState = " " + m.spinner.View()
+}
+
+header := titleStyle.Render("📡 VISUAL PING DASHBOARD") +
+	subTitleStyle.Render(fmt.Sprintf("  %d targets monitored%s", len(m.targets), pauseState))
+doc.WriteString(header + "\n\n")
+
+// Render Bubbles Table Component
+doc.WriteString(m.table.View() + "\n")
+
+// Target Details Panel with Bubbles Progress Bar
+cursor := m.table.Cursor()
+if len(m.targets) > 0 && cursor >= 0 && cursor < len(m.targets) {
+	selected := m.targets[cursor]
+	doc.WriteString("\n")
+
+	detailTitle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#BD93F9")).
+		Render(fmt.Sprintf("Target Details: %s:%d", selected.Host, selected.Port))
+
+	lossRatio := selected.LossPercentage() / 100.0
+	progressBar := m.lossProgress.ViewAs(lossRatio)
+
+	stats := fmt.Sprintf("%s %s   %s %s   %s %s   %s %d/%d\n%s Loss: %s",
+		statLabel.Render("Min:"), statVal.Render(fmt.Sprintf("%dms", selected.MinRtt.Milliseconds())),
+		statLabel.Render("Max:"), statVal.Render(fmt.Sprintf("%dms", selected.MaxRtt.Milliseconds())),
+		statLabel.Render("Avg:"), statVal.Render(fmt.Sprintf("%dms", selected.AvgRtt.Milliseconds())),
+		statLabel.Render("Sent/Recv:"), selected.Sent, selected.Received,
+		statLabel.Render("Packet Loss:"), progressBar,
+	)
+
+	if selected.LastError != "" {
+		stats += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("Last Error: "+selected.LastError)
+	}
+
+	boxWidth := m.width - 4
+	if boxWidth < 50 {
+		boxWidth = 60
+	}
+
+	detailBox := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#6272A4")).
+		Padding(0, 1).
+		Width(boxWidth).
+		Render(detailTitle + "\n" + stats)
+
+	doc.WriteString(detailBox + "\n")
+}
+
+// Modal / Input Status Line
+if m.addingHost {
+	doc.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#50FA7B")).Render("Enter host to ping (host:port): ") + m.inputField.View() + "\n")
+} else if m.statusMsg != "" {
+	doc.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Italic(true).Render("Status: "+m.statusMsg) + "\n")
+} else {
+	doc.WriteString("\n")
+}
+
+// Render Bubbles Help Component
+doc.WriteString(m.help.View(keys) + "\n")
+
+return doc.String()
+}func main() {p := tea.NewProgram(initialModel(), tea.WithAltScreen())if _, err := p.Run(); err != nil {fmt.Printf("Error running ping dashboard: %v\n", err)os.Exit(1)}}

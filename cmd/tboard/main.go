@@ -18,27 +18,33 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Sample records a latency measurement and its exact timestamp.
+type Sample struct {
+	Rtt       time.Duration // -1 indicates timeout/error
+	Timestamp time.Time
+}
+
 // Target represents a host monitored by the ping dashboard.
 type Target struct {
 	Host      string
 	Port      int
-	Rtts      []time.Duration // History of RTTs (-1 indicates timeout/error)
+	Samples   []Sample // Time-stamped history for variable time-axis rendering
 	Sent      int
 	Received  int
 	LastRtt   time.Duration
 	MinRtt    time.Duration
 	MaxRtt    time.Duration
 	AvgRtt    time.Duration
-	Status    string // "UP", "SLOW", "DOWN"
+	Status    string // "UP", "SLOW", "DOWN", "PENDING"
 	LastError string
 }
 
 func newTarget(host string, port int) Target {
 	return Target{
-		Host:   host,
-		Port:   port,
-		Rtts:   make([]time.Duration, 0, 30),
-		Status: "PENDING",
+		Host:    host,
+		Port:    port,
+		Samples: make([]Sample, 0, 180),
+		Status:  "PENDING",
 	}
 }
 
@@ -54,15 +60,20 @@ func (t Target) LossPercentage() float64 {
 // Add a ping measurement to the host history
 func (t *Target) AddResult(rtt time.Duration, err error) {
 	t.Sent++
-	const maxHistory = 30
+	const maxHistory = 180 // Up to 3 minutes of history
+
+	sample := Sample{
+		Timestamp: time.Now(),
+	}
+
 	if err != nil {
 		t.LastError = err.Error()
-		t.Rtts = append(t.Rtts, -1)
+		sample.Rtt = -1
 		t.Status = "DOWN"
 	} else {
 		t.Received++
 		t.LastRtt = rtt
-		t.Rtts = append(t.Rtts, rtt)
+		sample.Rtt = rtt
 		t.LastError = ""
 
 		if t.MinRtt == 0 || rtt < t.MinRtt {
@@ -74,9 +85,9 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 
 		var total time.Duration
 		validCount := 0
-		for _, r := range t.Rtts {
-			if r >= 0 {
-				total += r
+		for _, s := range t.Samples {
+			if s.Rtt >= 0 {
+				total += s.Rtt
 				validCount++
 			}
 		}
@@ -91,8 +102,9 @@ func (t *Target) AddResult(rtt time.Duration, err error) {
 		}
 	}
 
-	if len(t.Rtts) > maxHistory {
-		t.Rtts = t.Rtts[1:]
+	t.Samples = append(t.Samples, sample)
+	if len(t.Samples) > maxHistory {
+		t.Samples = t.Samples[1:]
 	}
 }
 
@@ -336,37 +348,94 @@ func colorToBGANSI(c lipgloss.TerminalColor) string {
 	return ""
 }
 
-func renderSparkline(rtts []time.Duration, width int, th Theme) string {
-	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+// renderSparkline applies logarithmic variable time-axis compression (C = 15.0).
+// Recent data (right) is spread out for high detail, while older data (left) is exponentially compressed.
+func renderSparkline(samples []Sample, width int, th Theme) string {
 	emptyFG := colorToFGANSI(th.SparklineEmpty)
 	greenFG := colorToFGANSI(th.SparklineGreen)
 	yelFG := colorToFGANSI(th.SparklineYel)
 	redFG := colorToFGANSI(th.SparklineRed)
 
-	if len(rtts) == 0 {
+	if len(samples) == 0 {
 		return emptyFG + strings.Repeat("░", width) + "\x1b[39m"
 	}
 
+	blocks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	const compression = 15.0 // Logarithmic compression factor C
+
+	now := time.Now()
+	oldestTime := samples[0].Timestamp
+	maxAge := now.Sub(oldestTime)
+	if maxAge < time.Second {
+		maxAge = time.Second
+	}
+
+	type bucket struct {
+		maxRtt   time.Duration
+		hasError bool
+		count    int
+	}
+	buckets := make([]bucket, width)
+
+	denom := math.Log(1.0 + compression)
+
+	// Map each timestamped sample into log-compressed x-coordinates
+	for _, s := range samples {
+		age := now.Sub(s.Timestamp)
+		if age < 0 {
+			age = 0
+		}
+		ageRatio := float64(age) / float64(maxAge)
+		if ageRatio > 1.0 {
+			ageRatio = 1.0
+		}
+
+		// Logarithmic distance from right edge (0.0 = right/now, 1.0 = left/oldest)
+		normDist := math.Log(1.0+compression*ageRatio) / denom
+		col := int(math.Round(float64(width-1) * (1.0 - normDist)))
+
+		if col < 0 {
+			col = 0
+		}
+		if col >= width {
+			col = width - 1
+		}
+
+		b := &buckets[col]
+		b.count++
+		if s.Rtt < 0 {
+			b.hasError = true
+		} else if s.Rtt > b.maxRtt {
+			b.maxRtt = s.Rtt // Peak-hold aggregation preserves spikes in compressed columns
+		}
+	}
+
+	// Forward-fill empty gaps between sparse buckets
+	lastValid := bucket{maxRtt: 0, hasError: false, count: 0}
+	for i := 0; i < width; i++ {
+		if buckets[i].count > 0 {
+			lastValid = buckets[i]
+		} else if lastValid.count > 0 {
+			buckets[i] = lastValid
+		}
+	}
+
 	var sb strings.Builder
+	for i := 0; i < width; i++ {
+		b := buckets[i]
+		if b.count == 0 {
+			sb.WriteString(emptyFG)
+			sb.WriteRune('░')
+			continue
+		}
 
-	slice := rtts
-	if len(slice) > width {
-		slice = slice[len(slice)-width:]
-	}
-
-	for i := 0; i < width-len(slice); i++ {
-		sb.WriteString(emptyFG)
-		sb.WriteRune('░')
-	}
-
-	for _, rtt := range slice {
-		if rtt < 0 {
+		if b.hasError {
 			sb.WriteString(redFG)
 			sb.WriteRune('✕')
 			continue
 		}
 
-		ms := float64(rtt.Microseconds()) / 1000.0
+		ms := float64(b.maxRtt.Microseconds()) / 1000.0
 		idx := int(math.Min(7, math.Max(0, (ms/150.0)*7)))
 
 		if ms < 40 {
@@ -380,7 +449,7 @@ func renderSparkline(rtts []time.Duration, width int, th Theme) string {
 		sb.WriteRune(blocks[idx])
 	}
 
-	sb.WriteString("\x1b[39m") // Reset foreground only
+	sb.WriteString("\x1b[39m") // Reset foreground color only
 	return sb.String()
 }
 
@@ -630,7 +699,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for i := range m.targets {
 				m.targets[i].Sent = 0
 				m.targets[i].Received = 0
-				m.targets[i].Rtts = nil
+				m.targets[i].Samples = nil
 				m.targets[i].MinRtt = 0
 				m.targets[i].MaxRtt = 0
 				m.targets[i].AvgRtt = 0
@@ -676,7 +745,7 @@ func (m model) renderTable() string {
 		}
 
 		badge := renderBadge(t.Status, th)
-		spark := renderSparkline(t.Rtts, sparkWidth, th)
+		spark := renderSparkline(t.Samples, sparkWidth, th)
 
 		rttStr := "---"
 		if t.LastRtt > 0 && t.Status != "DOWN" {

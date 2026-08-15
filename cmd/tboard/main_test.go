@@ -64,12 +64,18 @@ func TestRenderBadge(t *testing.T) {
 	}
 }
 
-func TestRenderSparkline(t *testing.T) {
-	rtts := []time.Duration{10 * time.Millisecond, 50 * time.Millisecond, -1, 200 * time.Millisecond}
+func TestRenderSparklineLogarithmicTime(t *testing.T) {
+	now := time.Now()
+	samples := []Sample{
+		{Rtt: 10 * time.Millisecond, Timestamp: now.Add(-60 * time.Second)},
+		{Rtt: 50 * time.Millisecond, Timestamp: now.Add(-30 * time.Second)},
+		{Rtt: -1, Timestamp: now.Add(-10 * time.Second)},
+		{Rtt: 200 * time.Millisecond, Timestamp: now},
+	}
 	th := themes[1] // Gruvbox Light
-	sparkline := renderSparkline(rtts, 10, th)
+	sparkline := renderSparkline(samples, 20, th)
 	if sparkline == "" {
-		t.Error("expected non-empty sparkline rendering")
+		t.Error("expected non-empty sparkline rendering for timestamped samples")
 	}
 }
 
