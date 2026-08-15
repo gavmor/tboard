@@ -29,12 +29,12 @@ type KeyMap struct {
 func NewKeyMap() KeyMap {
 	return KeyMap{
 		Up: key.NewBinding(
-			key.WithKeys("k"),
-			key.WithHelp("k", "up"),
+			key.WithKeys("up", "k"),
+			key.WithHelp("k/↑", "up"),
 		),
 		Down: key.NewBinding(
-			key.WithKeys("j"),
-			key.WithHelp("j", "down"),
+			key.WithKeys("down", "j"),
+			key.WithHelp("j/↓", "down"),
 		),
 		Add: key.NewBinding(
 			key.WithKeys("a"),
@@ -49,12 +49,12 @@ func NewKeyMap() KeyMap {
 			key.WithHelp("tab/v", "cycle view mode"),
 		),
 		CamUp: key.NewBinding(
-			key.WithKeys("w", "up"),
-			key.WithHelp("w/↑", "3D Z-depth +"),
+			key.WithKeys("w"),
+			key.WithHelp("w", "3D Z-depth +"),
 		),
 		CamDown: key.NewBinding(
-			key.WithKeys("s", "down"),
-			key.WithHelp("s/↓", "3D Z-depth -"),
+			key.WithKeys("s"),
+			key.WithHelp("s", "3D Z-depth -"),
 		),
 		CamLeft: key.NewBinding(
 			key.WithKeys("left"),

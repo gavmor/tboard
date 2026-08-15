@@ -40,8 +40,15 @@ func TestModel3DStackControls(t *testing.T) {
 		t.Errorf("expected initial viewMode View3DStack, got %v", m.viewMode)
 	}
 
+	// Test table selection / cursor navigation with down arrow key
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.cursor != 1 {
+		t.Errorf("expected cursor 1 after pressing Down arrow, got %d", m.cursor)
+	}
+
 	// Test 3D depth controls ('w')
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 	m = updated.(Model)
 	if m.depthY != 3 {
 		t.Errorf("expected depthY 3 after pressing 'w', got %d", m.depthY)
