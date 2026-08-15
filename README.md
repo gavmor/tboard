@@ -2,7 +2,7 @@
 
 An interactive, privilege-free visual **3D Ping Dashboard TUI** built in Go using [Bubble Tea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), [ntcharts](https://github.com/NimbleMarkets/ntcharts), and [Bubbles](https://github.com/charmbracelet/bubbles).
 
-![3D Ridgeline Stacked Waterfall View](docs/images/tboard_3d_waterfall_demo.jpg)
+![3D Ridgeline Stacked Waterfall Demo](docs/images/tboard_demo.gif)
 
 ---
 
